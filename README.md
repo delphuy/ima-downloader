@@ -1,109 +1,111 @@
-# IMA 知识库下载器（Python 版）
+# IMA Knowledge Base Downloader
 
-图形界面工具，粘贴 IMA 知识库分享链接，自动递归下载所有文件到本地。
+A cross-platform desktop tool to recursively download files from IMA Knowledge Base via share links — no install required, just double-click `start.bat`.
 
-## 功能
-
-- 📋 粘贴分享链接，自动提取 `share_id`
-- 📁 递归遍历知识库内所有文件夹
-- ⚡ 并发下载（20 线程），速度快
-- 🔄 增量下载：已存在的文件自动跳过，再次运行可断点续传
-- 🌙 暗色主题 GUI，界面清爽
+> **[中文版使用说明，请点击这里](./README_zh.md)**
 
 ---
 
-## 安装步骤
+## Features
 
-### 1. 安装 Python
+- 📋 Paste a share link — `share_id` extracted automatically
+- 📁 Recursive traversal of all subfolders
+- ⚡ Concurrent downloads (20 threads)
+- 🔄 Incremental download: skip existing files, resume anytime
+- 🌙 Dark-themed GUI, one-click startup
 
-需要 **Python 3.8 或以上版本**。
+---
 
-- 下载地址：<https://www.python.org/downloads/>
-- ⚠️ 安装时务必勾选 **`Add Python to PATH`**（非常重要）
+## Quick Start
 
-安装完成后，打开 CMD 验证：
+### 1. Install Python
+
+Requires **Python 3.8 or above**.
+
+- Download: <https://www.python.org/downloads/>
+- ⚠️ Be sure to check **Add Python to PATH** during install
+
+Verify:
 
 ```bash
 python --version
 ```
 
-能正常显示版本号即表示安装成功。
+### 2. Launch
 
-### 2. 双击 `start.bat`，自动完成后续操作
+Double-click **`start.bat`**. On first run it will:
+1. Check Python availability
+2. Install the `requests` dependency (one-time only)
+3. Open the GUI
 
-`start.bat` 会自动：
-1. 检查 Python 是否已安装
-2. 安装依赖（`requests`，仅首次需要）
-3. 启动 GUI 程序
-
-> 后续使用时直接双击 `start.bat` 即可，无需重复安装依赖。
+Subsequent runs: just double-click `start.bat` — done.
 
 ---
 
-## 使用步骤
+## How to Use
 
-1. **打开 IMA 知识库**，点击右上角 **分享 → 复制链接**
-2. **双击 `start.bat`**，稍等片刻，GUI 窗口会弹出
-3. **粘贴链接**到"分享链接"文本框（示例文字会自动消失）
-4. **选择保存目录**（默认保存到 `downloads/` 文件夹）
-5. 点击 **▶ 开始下载**，等待完成即可
+1. Open the **IMA Knowledge Base** → click **Share → Copy Link**
+2. Double-click **`start.bat`**, wait for the GUI window
+3. **Paste the link** into the share-link text box
+4. **Choose save folder** (default: `downloads/`)
+5. Click **▶ Start Download**
 
-下载过程中：
-- 顶部进度条显示当前正在下载的文件 `[第几个/总数] 文件名`
-- 下方日志区显示跳过、完成、失败等关键信息
-- 下载开始后，输入框和按钮会自动禁用，防止误操作
-- 如需中断，点击 **⏹ 取消**
-
----
-
-## 增量下载（断点续传）
-
-程序每次运行前会自动扫描保存目录，已存在的文件直接跳过，不会重复下载。
-
-**场景**：第一次下载中断了，再次双击 `start.bat` 运行，会自动跳过已下载完成的文件，只下载剩余的。
+During download:
+- Top progress bar shows current file `[N/Total] filename.ext`
+- Log area shows skip / success / failure events
+- All inputs are locked during download to prevent accidents
+- Click **⏹ Cancel** to abort
 
 ---
 
-## 目录结构
+## Incremental Download
+
+The program scans the save directory before each run. Already-downloaded files are skipped automatically — no duplicates, safe to re-run anytime.
+
+---
+
+## Project Structure
 
 ```
-IMA_downluad/
-├── gui.py             # GUI 主程序（双击 start.bat 启动它）
-├── api_service.py     # IMA API 调用封装
-├── downloader.py      # 文件下载（并发 + 断点续传）
-├── models.py          # 数据模型
-├── requirements.txt   # Python 依赖（仅需 requests）
-├── start.bat          # 一键启动脚本（环境检查 + 安装依赖 + 启动 GUI）
-└── README.md          # 本文件
+.
+├── gui.py           # GUI main entry (start via start.bat)
+├── api_service.py   # IMA API wrapper
+├── downloader.py    # Download engine (concurrent + resume)
+├── models.py        # Data models
+├── sync_manager.py  # Recursive traversal + retry logic
+├── main.py          # CLI entry point
+├── requirements.txt # Python dependencies (requests only)
+├── start.bat        # One-click launcher
+└── README.md        # This file
 ```
 
 ---
 
-## 常见问题
+## Configuration
 
-**Q：双击 `start.bat` 没反应 / 一闪而过？**
-A：用右键 → 编辑 打开 `start.bat`，在最后一行加 `pause`，保存后双击，可以看到错误信息。最常见原因是 Python 没有加入 PATH。
-
-**Q：提示"无法提取 share_id"？**
-A：检查分享链接是否完整，确保包含 `shareId=xxxxxxxx` 这一段。直接把 IMA 复制的整段文字粘贴进去即可，程序会自动提取。
-
-**Q：下载到一半取消了，再次运行会重复下载吗？**
-A：不会。程序会自动跳过已存在的文件，只下载缺失的部分。
-
-**Q：下载失败的文件怎么办？**
-A：日志区会显示 `[FAIL] 文件名 — 错误原因`，确认问题后重新运行即可，已下载的文件不会重复下载。
-
----
-
-## 开发说明
-
-如需修改并发线程数、请求超时等参数，编辑 `downloader.py` 顶部的配置常量：
+To tweak concurrency or timeouts, edit `downloader.py`:
 
 ```python
-TIMEOUT = 30          # 请求超时（秒）
-MAX_WORKERS = 20      # 并发线程数
+TIMEOUT = 30       # HTTP request timeout (seconds)
+MAX_WORKERS = 20   # Concurrent download threads
 ```
 
 ---
 
-*Python 重写版，基于 [itscj1014/ima-download](https://github.com/itscj1014/ima-download) （Java 原版）*
+## FAQ
+
+**Q: `start.bat` flashes and disappears with no window?**
+A: Right-click → Edit `start.bat`, add `pause` on the last line, save and re-run to see the error. Most common cause: Python is not in PATH.
+
+**Q: "Cannot extract share_id"?**
+A: Make sure the copied link contains `shareId=xxxxxxxx`. Paste the full text as-is — the program extracts the ID automatically.
+
+**Q: Download was interrupted. Will it re-download everything?**
+A: No. Already-present files are skipped automatically on re-run.
+
+**Q: A file failed to download. What now?**
+A: The log shows `[FAIL] filename — error reason`. Fix the issue and re-run — already-downloaded files won't be duplicated.
+
+---
+
+*Python port of [itscj1014/ima-download](https://github.com/itscj1014/ima-download) (original Java version)*
