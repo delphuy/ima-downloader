@@ -94,9 +94,6 @@ def s(key, **kw):
 STARTUP_DELAY = 5
 CHECK_TIMEOUT = 600
 
-_running_checker = None
-
-
 def start_update_checker(on_version_found):
     global _running_checker
     if _running_checker is not None and _running_checker.is_alive():
@@ -107,7 +104,7 @@ def start_update_checker(on_version_found):
         new_ver = None
         try:
             req = urllib.request.Request(UPDATE_API, headers={"Accept": "application/vnd.github.v3+json"})
-            with urllib.request.urlopen(req, timeout=CHECK_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read())
                 new_ver = data.get("tag_name", "").lstrip("v")
         except Exception:
@@ -119,7 +116,6 @@ def start_update_checker(on_version_found):
 
     t = threading.Thread(target=checker, daemon=True)
     t.start()
-    _running_checker = t
 
 
 def download_and_apply_update(zip_url, new_ver, on_done, on_progress, on_open_github):
@@ -442,7 +438,7 @@ class ImaDownloaderGUI:
     # ----------------------------------------------------------------
     # UPDATE CHECK
     # ----------------------------------------------------------------
-    def _on_version_found(self, new_ver):
+    def _on_version_found(self, new_ver, err_msg=None):
         if new_ver and self._compare_ver(new_ver):
             self._new_ver = new_ver
             self._widgets["lbl_update"].configure(text=s("update_avail", new_ver=new_ver))
