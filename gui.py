@@ -17,7 +17,7 @@ from downloader import extract_download_url, sanitize_filename, download_single_
 # ============================================================
 # VERSION & UPDATE CONFIG
 # ============================================================
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.0.1"
 UPDATE_API = "https://api.github.com/repos/delphuy/ima-downloader/releases/latest"
 GITHUB_RELEASES = "https://github.com/delphuy/ima-downloader/releases"
 
