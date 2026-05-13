@@ -7,7 +7,6 @@ import sys
 import zipfile
 import tempfile
 import shutil
-import subprocess
 import time
 from pathlib import Path
 from tkinter import Tk, Entry, Button, Label, Frame, END, DISABLED, NORMAL, filedialog, Text
@@ -21,7 +20,6 @@ from downloader import extract_download_url, sanitize_filename, download_single_
 __VERSION__ = "1.0.0"
 UPDATE_API = "https://api.github.com/repos/delphuy/ima-downloader/releases/latest"
 GITHUB_RELEASES = "https://github.com/delphuy/ima-downloader/releases"
-ZIP_URL = "https://github.com/delphuy/ima-downloader/releases/download/v1.0.0/ima-downloader-v1.0.0.zip"
 
 # ============================================================
 # STRINGS (English / Chinese)
@@ -39,11 +37,7 @@ LANG["en"] = {
     "ready":         "Ready — paste a share link to begin",
     "preparing":     "Preparing...",
     "update_avail":  "🆕 Update available: v{new_ver} — click to download",
-    "no_update":     "Already on latest version v{ver}",
-    "check_update":  "Checking for updates...",
-    "update_fail":   "Update check timed out",
     "no_share_id":   "Cannot extract share_id — check the link",
-    "downloading":    "Downloading...",
     "done_ok":       "✅ Download complete",
     "done_fail":     "❌ Download failed",
     "cancelled":     "⏹ Cancelled",
@@ -52,11 +46,12 @@ LANG["en"] = {
     "existing":      "Already present: {n} files",
     "folder":        "📁 {name}",
     "update_dismiss": "✕",
-    "lang_label":    "EN | 中文",
+    "lang_label":    "中文 | EN",
+    "btn_update":    "⬇ Update",
     "updating":      "⬇ Downloading update v{new_ver}...",
     "update_done":   "✅ Update downloaded! Restart to apply.",
-    "update_failed": "❌ Update failed — please download manually.",
-    "open_github":   "🌐 Open GitHub page",
+    "update_failed": "❌ Update failed — download manually.",
+    "open_github":   "🌐 GitHub",
 }
 
 LANG["zh"] = {
@@ -70,11 +65,7 @@ LANG["zh"] = {
     "ready":         "就绪 — 粘贴分享链接即可开始",
     "preparing":     "准备中...",
     "update_avail":  "🆕 发现新版本 v{new_ver} — 点击自动更新",
-    "no_update":     "已是最新版本 v{ver}",
-    "check_update":  "检查更新中...",
-    "update_fail":   "更新检查超时",
     "no_share_id":   "❌ 无法提取 share_id，请检查链接",
-    "downloading":    "下载中...",
     "done_ok":       "✅ 全部下载完成",
     "done_fail":     "❌ 下载失败",
     "cancelled":     "⏹ 已取消",
@@ -83,11 +74,12 @@ LANG["zh"] = {
     "existing":      "已存在 {n} 个文件",
     "folder":        "📁 {name}",
     "update_dismiss": "✕",
-    "lang_label":    "EN | 中文",
+    "lang_label":    "中文 | EN",
+    "btn_update":    "⬇ 更新",
     "updating":      "⬇ 正在下载更新 v{new_ver}...",
     "update_done":   "✅ 更新已下载！请重启程序以应用。",
     "update_failed": "❌ 自动更新失败，请手动下载。",
-    "open_github":   "🌐 打开 GitHub 下载页",
+    "open_github":   "🌐 GitHub",
 }
 
 
@@ -96,44 +88,32 @@ def s(key, **kw):
 
 
 # ============================================================
-# VERSION CHECKER — runs in dedicated background thread
-#
-# Lifecycle:
-#   1. Wait STARTUP_DELAY seconds (GUI gets to show "就绪" first)
-#   2. Start CHECK_THREAD: fetch GitHub API, 600s timeout
-#      → on success: show banner if newer version
-#      → on timeout: silently stop checking
-#   3. If user clicks "Update": download zip → extract → open GitHub page
+# VERSION CHECKER — silent, no UI notification
 # ============================================================
-STARTUP_DELAY = 5       # seconds to wait before starting update check
-CHECK_TIMEOUT = 600     # seconds for the GitHub API call
-UPDATE_TIMEOUT = 60     # seconds for zip download
+STARTUP_DELAY = 5
+CHECK_TIMEOUT = 600
 
-_running_checker = None  # module-level reference to checker thread
+_running_checker = None
 
 
-def start_update_checker(on_version_found, on_check_done):
-    """Launch the update-check thread if not already running."""
+def start_update_checker(on_version_found):
     global _running_checker
     if _running_checker is not None and _running_checker.is_alive():
-        return  # already checking
+        return
 
     def checker():
         time.sleep(STARTUP_DELAY)
-
         new_ver = None
         try:
             req = urllib.request.Request(UPDATE_API, headers={"Accept": "application/vnd.github.v3+json"})
             with urllib.request.urlopen(req, timeout=CHECK_TIMEOUT) as resp:
                 data = json.loads(resp.read())
-                tag = data.get("tag_name", "")
-                new_ver = tag.lstrip("v")
+                new_ver = data.get("tag_name", "").lstrip("v")
         except Exception:
             pass
 
         def notify():
             on_version_found(new_ver)
-            on_check_done()
         ImaDownloaderGUI._root_after(notify)
 
     t = threading.Thread(target=checker, daemon=True)
@@ -142,51 +122,36 @@ def start_update_checker(on_version_found, on_check_done):
 
 
 def download_and_apply_update(zip_url, new_ver, on_done, on_progress, on_open_github):
-    """
-    Download the update zip, extract into current directory, then open GitHub.
-    Calls on_done(success: bool) when finished.
-    """
     def worker():
         tmp_dir = None
         try:
             zip_path = os.path.join(tempfile.gettempdir(), f"ima-update-{new_ver}.zip")
 
-            # Download zip
             def report(pct):
                 ImaDownloaderGUI._root_after(lambda: on_progress(pct))
 
             report(0)
-            urllib.request.urlretrieve(zip_url, zip_path,
+            urllib.request.urlretrieve(zip_path, zip_path,
                                        reporthook=lambda *a: report(min(int(a[2]*100/a[3]), 99)))
             report(99)
 
-            # Extract over current files
             tmp_dir = tempfile.mkdtemp(prefix="ima-update-")
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 zf.extractall(tmp_dir)
 
-            src_dir = Path(tmp_dir)
             proj_dir = Path(sys.argv[0]).parent.resolve()
-            for f in src_dir.iterdir():
+            for f in Path(tmp_dir).iterdir():
                 dst = proj_dir / f.name
                 if dst.is_dir() and not dst.is_file():
-                    # Don't overwrite dirs — skip
                     continue
                 shutil.copy2(f, dst)
 
             report(100)
-
-            # Open GitHub page
             ImaDownloaderGUI._root_after(on_open_github)
+            ImaDownloaderGUI._root_after(lambda: on_done(True))
 
-            def finish_ok():
-                on_done(True)
-            ImaDownloaderGUI._root_after(finish_ok)
-
-        except Exception as e:
-            def finish_fail():
-                on_done(False)
-            ImaDownloaderGUI._root_after(finish_fail)
+        except Exception:
+            ImaDownloaderGUI._root_after(lambda: on_done(False))
         finally:
             if tmp_dir:
                 try:
@@ -225,7 +190,6 @@ class DownloadTask:
         self.on_progress = on_progress
         self.on_done = on_done
         self._cancelled = False
-        self._done_count = 0
 
     def cancel(self):
         self._cancelled = True
@@ -291,13 +255,11 @@ class DownloadTask:
     def _download_one(self, item, root_path, existing):
         name = item['name']
         if name in existing:
-            self._done_count += 1
             self.on_log(f"[跳过] {name}")
             return
         out = root_path / name
         try:
             download_single_file(item['url'], out, on_log=None)
-            self._done_count += 1
             self.on_log(f"✅ {name}")
         except Exception as e:
             self.on_log(f"[FAIL] {name} — {e}")
@@ -307,146 +269,135 @@ class DownloadTask:
 # GUI
 # ============================================================
 class ImaDownloaderGUI:
-    _lang = "zh"
+    _lang = "en"          # default to English
     _root_after = None
 
     def __init__(self):
         self.root = Tk()
         ImaDownloaderGUI._root_after = self.root.after
-        self.root.title("IMA 知识库下载器")
+        self.root.title("IMA Knowledge Base Downloader")
         self.root.geometry("800x680")
         self.root.configure(bg="#1e1e2e")
         self._task = None
         self._has_placeholder = True
-        self._update_shown = False
         self._update_dismissed = False
         self._new_ver = None
-        self._update_progress_pct = None
 
-        # Update banner components
-        self._update_bar = None
-        self._lbl_update = None
-        self._btn_update = None
-        self._btn_dismiss = None
-        self._btn_github = None
+        # All widgets that need language refresh
+        self._widgets = {}
 
         self._build_ui()
         self._entry_dir.insert(0, str(Path("downloads").resolve()))
 
-        # Show "ready" immediately, start background update check after 5s
-        self._lbl_progress.configure(text=s("ready"))
-        start_update_checker(
-            on_version_found=self._on_version_found,
-            on_check_done=self._on_check_done
-        )
+        # Show ready silently, start background update check after 5s
+        self._widgets["lbl_progress"].configure(text=s("ready"))
+        start_update_checker(on_version_found=self._on_version_found)
 
     # ----------------------------------------------------------------
-    # UI BUILD
+    # BUILD UI
     # ----------------------------------------------------------------
     def _build_ui(self):
-        bg = "#1e1e2e"
-        surface = "#2a2a3c"
-        accent = "#7c6af4"
-        text = "#e8e8f0"
-        dim = "#666688"
-        warn = "#f5c542"
+        bg, surface, accent, text, dim, warn = "#1e1e2e", "#2a2a3c", "#7c6af4", "#e8e8f0", "#666688", "#f5c542"
 
-        # Title bar
+        # ── Title bar ──
         top = Frame(self.root, bg=bg)
         top.pack(fill="x", padx=16, pady=(8, 0))
         top.columnconfigure(0, weight=1)
 
-        lbl_title = Label(top, text=s("title"),
-                          font=("Microsoft YaHei", 15, "bold"),
-                          fg=accent, bg=bg, anchor="w")
-        lbl_title.grid(row=0, column=0)
-        self._lbl_title = lbl_title
+        self._widgets["lbl_title"] = Label(top, text=s("title"),
+                                            font=("Microsoft YaHei", 15, "bold"),
+                                            fg=accent, bg=bg, anchor="w")
+        self._widgets["lbl_title"].grid(row=0, column=0)
 
         btn_lang = Button(top, text=s("lang_label"),
                           font=("Consolas", 8),
                           bg=bg, fg=dim, relief="flat", bd=0,
                           cursor="hand2", command=self._toggle_lang)
         btn_lang.grid(row=0, column=1, padx=(0, 4))
+        self._widgets["btn_lang"] = btn_lang
 
-        # Update banner (hidden initially)
-        self._update_bar = Frame(self.root, bg="#2d2a10", height=40)
-        self._update_bar.pack(fill="x", padx=12, pady=(6, 0))
-        self._update_bar.pack_forget()
-        self._update_bar.columnconfigure(0, weight=1)
+        # ── Update banner (hidden) ──
+        bar = Frame(self.root, bg="#2d2a10", height=40)
+        bar.pack(fill="x", padx=12, pady=(6, 0))
+        bar.pack_forget()
+        bar.columnconfigure(0, weight=1)
+        self._update_bar = bar
 
-        self._lbl_update = Label(self._update_bar,
-                                 font=("Microsoft YaHei", 10),
-                                 fg=warn, bg="#2d2a10", anchor="w")
-        self._lbl_update.grid(row=0, column=0, padx=8, pady=6, sticky="ew")
+        self._widgets["lbl_update"] = Label(bar, font=("Microsoft YaHei", 10),
+                                             fg=warn, bg="#2d2a10", anchor="w")
+        self._widgets["lbl_update"].grid(row=0, column=0, padx=8, pady=6, sticky="ew")
 
-        btn_row = Frame(self._update_bar, bg="#2d2a10")
+        btn_row = Frame(bar, bg="#2d2a10")
         btn_row.grid(row=0, column=1, padx=(0, 4), pady=4, sticky="ns")
 
-        self._btn_update = Button(btn_row, text="⬇ 更新",
-                                  font=("Microsoft YaHei", 9, "bold"),
-                                  bg=accent, fg="white", relief="flat",
-                                  cursor="hand2", command=self._do_update)
-        self._btn_update.pack(side="left", padx=2)
+        self._widgets["btn_update"] = Button(btn_row, text=s("btn_update"),
+                                             font=("Microsoft YaHei", 9, "bold"),
+                                             bg=accent, fg="white", relief="flat",
+                                             cursor="hand2", command=self._do_update)
+        self._widgets["btn_update"].pack(side="left", padx=2)
 
-        self._btn_github = Button(btn_row, text=s("open_github"),
-                                  font=("Microsoft YaHei", 9),
-                                  bg="#3d3d5c", fg=text, relief="flat",
-                                  cursor="hand2", command=self._open_github)
-        self._btn_github.pack(side="left", padx=2)
+        self._widgets["btn_github"] = Button(btn_row, text=s("open_github"),
+                                              font=("Microsoft YaHei", 9),
+                                              bg="#3d3d5c", fg=text, relief="flat",
+                                              cursor="hand2", command=self._open_github)
+        self._widgets["btn_github"].pack(side="left", padx=2)
 
-        self._btn_dismiss = Button(btn_row, text=s("update_dismiss"),
-                                    font=("Consolas", 9),
-                                    bg="#2d2a10", fg=dim, relief="flat",
-                                    cursor="hand2", command=self._dismiss_update)
-        self._btn_dismiss.pack(side="left", padx=2)
+        self._widgets["btn_dismiss"] = Button(btn_row, text=s("update_dismiss"),
+                                               font=("Consolas", 9),
+                                               bg="#2d2a10", fg=dim, relief="flat",
+                                               cursor="hand2", command=self._dismiss_update)
+        self._widgets["btn_dismiss"].pack(side="left", padx=2)
 
-        # Main card
+        # ── Main card ──
         frame = Frame(self.root, bg=surface, padx=16, pady=10)
         frame.pack(fill="x", padx=12, pady=(6, 0))
 
         Label(frame, text=s("share_label"),
               fg=text, bg=surface).grid(row=0, column=0, sticky="w")
 
-        ph_text = s("share_ph")
         self._text_share = Text(frame, font=("Microsoft YaHei", 10),
                                 bg="#111120", fg=dim,
                                 insertbackground=accent,
                                 height=5, wrap="word", padx=6, pady=4)
         self._text_share.grid(row=1, column=0, columnspan=2, sticky="ew")
-        self._text_share.insert("1.0", ph_text)
+        self._text_share.insert("1.0", s("share_ph"))
         self._text_share.bind("<FocusIn>", self._on_share_focus_in)
         self._text_share.bind("<FocusOut>", self._on_share_focus_out)
         frame.columnconfigure(0, weight=1)
 
         Label(frame, text=s("dir_label"),
               fg=text, bg=surface).grid(row=2, column=0, sticky="w", pady=(10, 0))
+
         self._entry_dir = Entry(frame, font=("Consolas", 10), bg="#111120", fg=text)
         self._entry_dir.grid(row=3, column=0, sticky="ew", ipady=4)
-        self._btn_browse = Button(frame, text=s("browse"),
-                                  command=self._browse, bg="#3d3d5c", fg=text)
-        self._btn_browse.grid(row=3, column=1, padx=(6, 0))
+
+        self._widgets["btn_browse"] = Button(frame, text=s("browse"),
+                                              command=self._browse, bg="#3d3d5c", fg=text)
+        self._widgets["btn_browse"].grid(row=3, column=1, padx=(6, 0))
 
         btn_frame = Frame(frame, bg=surface)
         btn_frame.grid(row=4, column=0, columnspan=2, pady=(15, 5))
-        self._btn_start = Button(btn_frame, text=s("start"),
-                                  command=self._start,
-                                  bg=accent, fg="white",
-                                  font=("Microsoft YaHei", 10, "bold"), padx=20)
-        self._btn_start.pack(side="left", padx=5)
-        self._btn_cancel = Button(btn_frame, text=s("cancel"),
-                                   bg="#3d3d5c", fg=text, padx=20)
-        self._btn_cancel.pack(side="left", padx=5)
 
-        # Progress
-        self._lbl_progress = Label(self.root, text=s("ready"),
-                                   font=("Consolas", 12, "bold"),
-                                   fg=accent, bg=bg, height=2, anchor="w")
-        self._lbl_progress.pack(fill="x", padx=16, pady=(8, 4))
+        self._widgets["btn_start"] = Button(btn_frame, text=s("start"),
+                                             command=self._start,
+                                             bg=accent, fg="white",
+                                             font=("Microsoft YaHei", 10, "bold"), padx=20)
+        self._widgets["btn_start"].pack(side="left", padx=5)
+
+        self._widgets["btn_cancel"] = Button(btn_frame, text=s("cancel"),
+                                              bg="#3d3d5c", fg=text, padx=20)
+        self._widgets["btn_cancel"].pack(side="left", padx=5)
+
+        # ── Progress ──
+        self._widgets["lbl_progress"] = Label(self.root, text=s("ready"),
+                                              font=("Consolas", 12, "bold"),
+                                              fg=accent, bg=bg, height=2, anchor="w")
+        self._widgets["lbl_progress"].pack(fill="x", padx=16, pady=(8, 4))
 
         sep = Frame(self.root, bg=accent, height=2)
         sep.pack(fill="x", padx=12)
 
-        # Log
+        # ── Log ──
         self._log_widget = scrolledtext.ScrolledText(
             self.root, font=("Consolas", 9),
             bg="#111120", fg="#d4d4e8", state="disabled",
@@ -458,34 +409,49 @@ class ImaDownloaderGUI:
         self._log_widget.tag_configure("err", foreground="#f4706c")
 
     # ----------------------------------------------------------------
-    # LANGUAGE
+    # LANGUAGE TOGGLE — refresh all UI strings
     # ----------------------------------------------------------------
     def _toggle_lang(self):
-        ImaDownloaderGUI._lang = "en" if self._lang == "zh" else "zh"
-        self._lbl_title.configure(text=s("title"))
-        self._lbl_progress.configure(text=s("ready"))
+        ImaDownloaderGUI._lang = "zh" if self._lang == "en" else "en"
+
+        w = self._widgets
+        w["lbl_title"].configure(text=s("title"))
+        w["lbl_progress"].configure(text=s("ready"))
+        w["btn_lang"].configure(text=s("lang_label"))
+        w["btn_browse"].configure(text=s("browse"))
+        w["btn_start"].configure(text=s("start"))
+        w["btn_cancel"].configure(text=s("cancel"))
+        w["btn_update"].configure(text=s("btn_update"))
+        w["btn_github"].configure(text=s("open_github"))
+        w["btn_dismiss"].configure(text=s("update_dismiss"))
+
+        # Refresh share text placeholder (keep current content unless it was placeholder)
+        was_placeholder = self._has_placeholder
+        cur = self._text_share.get("1.0", END).strip()
+        self._text_share.delete("1.0", END)
+        if was_placeholder or not cur:
+            self._text_share.insert("1.0", s("share_ph"))
+            self._text_share.configure(fg=("#666688"))
+            self._has_placeholder = True
+        else:
+            self._text_share.insert("1.0", cur)
+            self._text_share.configure(fg="#e8e8f0")
+            self._has_placeholder = False
 
     # ----------------------------------------------------------------
-    # UPDATE CHECK RESULTS
+    # UPDATE CHECK
     # ----------------------------------------------------------------
     def _on_version_found(self, new_ver):
-        """Called from main thread when version check completes."""
         if new_ver and self._compare_ver(new_ver):
             self._new_ver = new_ver
-            self._show_update_bar(new_ver)
-        # else: already latest, don't touch status bar
-
-    def _on_check_done(self):
-        """Called when the check thread finishes (success or timeout)."""
-        # Status bar already shows ready / update banner
-        pass
+            self._widgets["lbl_update"].configure(text=s("update_avail", new_ver=new_ver))
+            self._update_bar.pack(fill="x", padx=12, pady=(6, 0))
 
     def _compare_ver(self, new_ver):
         def v(vstr):
             return [int(x) for x in vstr.split(".") if x.isdigit()]
         try:
-            nv = v(new_ver)
-            cv = v(__VERSION__)
+            nv, cv = v(new_ver), v(__VERSION__)
             for a, b in zip(nv, cv):
                 if a > b:
                     return True
@@ -494,10 +460,6 @@ class ImaDownloaderGUI:
             return len(nv) > len(cv)
         except Exception:
             return False
-
-    def _show_update_bar(self, new_ver):
-        self._lbl_update.configure(text=s("update_avail", new_ver=new_ver))
-        self._update_bar.pack(fill="x", padx=12, pady=(6, 0))
 
     def _dismiss_update(self):
         self._update_dismissed = True
@@ -511,55 +473,52 @@ class ImaDownloaderGUI:
         if not self._new_ver:
             return
         new_ver = self._new_ver
-        self._lbl_progress.configure(text=s("updating", new_ver=new_ver))
-        self._btn_update.configure(state=DISABLED, text="⬇ ...")
-        self._btn_github.configure(state=DISABLED)
-        self._btn_dismiss.configure(state=DISABLED)
+        self._widgets["lbl_progress"].configure(text=s("updating", new_ver=new_ver))
+        self._widgets["btn_update"].configure(state=DISABLED, text="⬇ ...")
+        self._widgets["btn_github"].configure(state=DISABLED)
+        self._widgets["btn_dismiss"].configure(state=DISABLED)
 
         def on_progress(pct):
-            self.root.after(0, lambda: self._lbl_progress.configure(
+            ImaDownloaderGUI._root_after(0, lambda: self._widgets["lbl_progress"].configure(
                 text=f"{s('updating', new_ver=new_ver)} [{pct}%]"))
 
         def on_done(ok):
-            if ok:
-                self._lbl_progress.configure(text=s("update_done"))
-                self._add_log(s("update_done"))
-            else:
-                self._lbl_progress.configure(text=s("update_failed"))
-                self._btn_update.configure(state=NORMAL, text="⬇ 重试")
-                self._btn_github.configure(state=NORMAL)
-                self._btn_dismiss.configure(state=NORMAL)
+            ImaDownloaderGUI._root_after(0, lambda: self._finish_update(ok, new_ver))
 
         zip_url = f"https://github.com/delphuy/ima-downloader/releases/download/{new_ver}/ima-downloader-{new_ver}.zip"
-        download_and_apply_update(
-            zip_url=zip_url,
-            new_ver=new_ver,
-            on_done=on_done,
-            on_progress=on_progress,
-            on_open_github=self._open_github
-        )
+        download_and_apply_update(zip_url, new_ver, on_done, on_progress, self._open_github)
+
+    def _finish_update(self, ok, new_ver):
+        if ok:
+            self._widgets["lbl_progress"].configure(text=s("update_done"))
+            self._add_log(s("update_done"))
+        else:
+            self._widgets["lbl_progress"].configure(text=s("update_failed"))
+            self._widgets["btn_update"].configure(state=NORMAL, text=s("btn_update"))
+            self._widgets["btn_github"].configure(state=NORMAL)
+            self._widgets["btn_dismiss"].configure(state=NORMAL)
 
     # ----------------------------------------------------------------
     # INPUT HELPERS
     # ----------------------------------------------------------------
     def _on_share_focus_in(self, _):
         if self._has_placeholder:
-            self._text_share.delete("1.0", "end-1c")
+            self._text_share.delete("1.0", END)
             self._text_share.configure(fg="#e8e8f0")
             self._has_placeholder = False
 
     def _on_share_focus_out(self, _):
-        content = self._text_share.get("1.0", "end-1c").strip()
+        content = self._text_share.get("1.0", END).strip()
         if not content:
-            ph_text = s("share_ph")
-            self._text_share.insert("1.0", ph_text)
+            self._text_share.delete("1.0", END)
+            self._text_share.insert("1.0", s("share_ph"))
             self._text_share.configure(fg="#666688")
             self._has_placeholder = True
 
     def _get_share_text(self):
         if self._has_placeholder:
             return ""
-        return self._text_share.get("1.0", "end-1c").strip()
+        return self._text_share.get("1.0", END).strip()
 
     def _browse(self):
         p = filedialog.askdirectory()
@@ -571,8 +530,8 @@ class ImaDownloaderGUI:
         s_state = NORMAL if enabled else DISABLED
         self._text_share.configure(state=s_state)
         self._entry_dir.configure(state=s_state)
-        self._btn_browse.configure(state=s_state)
-        self._btn_start.configure(state=s_state)
+        self._widgets["btn_browse"].configure(state=s_state)
+        self._widgets["btn_start"].configure(state=s_state)
 
     def _add_log(self, msg):
         self._log_widget.configure(state="normal")
@@ -580,17 +539,15 @@ class ImaDownloaderGUI:
         self._log_widget.configure(state="disabled")
 
     def _on_progress(self, current, total, name):
-        self.root.after(0, lambda: self._lbl_progress.configure(
-            text=f"[{current}/{total}] {name}"
-        ))
+        self.root.after(0, lambda: self._widgets["lbl_progress"].configure(
+            text=f"[{current}/{total}] {name}"))
 
     def _on_done(self, ok):
         self.root.after(0, lambda: self._finish(ok))
 
     def _finish(self, ok):
         self._set_ui(True)
-        self._lbl_progress.configure(
-            text=s("done_ok") if ok else s("done_fail"))
+        self._widgets["lbl_progress"].configure(text=s("done_ok") if ok else s("done_fail"))
 
     # ----------------------------------------------------------------
     # ACTIONS
@@ -599,11 +556,11 @@ class ImaDownloaderGUI:
         content = self._get_share_text()
         sid = extract_share_id(content)
         if not sid:
-            self._lbl_progress.configure(text=s("no_share_id"))
+            self._widgets["lbl_progress"].configure(text=s("no_share_id"))
             return
         save = Path(self._entry_dir.get() or "downloads")
         self._set_ui(False)
-        self._lbl_progress.configure(text=s("preparing"))
+        self._widgets["lbl_progress"].configure(text=s("preparing"))
         self._log_widget.configure(state="normal")
         self._log_widget.delete("1.0", END)
         self._log_widget.configure(state="disabled")
@@ -615,7 +572,7 @@ class ImaDownloaderGUI:
     def _cancel(self):
         if self._task:
             self._task.cancel()
-            self._lbl_progress.configure(text=s("cancelled"))
+            self._widgets["lbl_progress"].configure(text=s("cancelled"))
 
     def run(self):
         self.root.mainloop()
