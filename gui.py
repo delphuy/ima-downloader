@@ -18,7 +18,7 @@ from downloader import extract_download_url, sanitize_filename, download_single_
 # ============================================================
 # VERSION & UPDATE CONFIG
 # ============================================================
-__VERSION__ = "1.0.1"
+__VERSION__ = "1.0.2"
 UPDATE_API = "https://api.github.com/repos/delphuy/ima-downloader/releases/latest"
 GITHUB_RELEASES = "https://github.com/delphuy/ima-downloader/releases"
 
@@ -48,6 +48,7 @@ LANG["en"] = {
     "folder":        "📁 {name}",
     "update_dismiss": "✕",
     "lang_label":    "中文 | EN",
+    "btn_check_update": "🔄 Check Update",
     "btn_update":    "⬇ Update",
     "updating":      "⬇ Downloading update v{new_ver}...",
     "update_done":   "✅ Update downloaded! Restart to apply.",
@@ -76,6 +77,7 @@ LANG["zh"] = {
     "folder":        "📁 {name}",
     "update_dismiss": "✕",
     "lang_label":    "中文 | EN",
+    "btn_check_update": "🔄 检查更新",
     "btn_update":    "⬇ 更新",
     "updating":      "⬇ 正在下载更新 v{new_ver}...",
     "update_done":   "✅ 更新已下载！请重启程序以应用。",
@@ -92,7 +94,7 @@ def s(key, **kw):
 # VERSION CHECKER — silent, no UI notification
 # ============================================================
 STARTUP_DELAY = 5
-CHECK_TIMEOUT = 600
+_running_checker = None  # FIX 1: 添加缺失的全局变量声明
 
 def start_update_checker(on_version_found):
     global _running_checker
@@ -104,7 +106,13 @@ def start_update_checker(on_version_found):
         new_ver = None
         try:
             req = urllib.request.Request(UPDATE_API, headers={"Accept": "application/vnd.github.v3+json"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            
+            # 支持代理：自动检测系统代理环境变量
+            proxy_handler = urllib.request.ProxyHandler()
+            opener = urllib.request.build_opener(proxy_handler)
+            urllib.request.install_opener(opener)
+            
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read())
                 new_ver = data.get("tag_name", "").lstrip("v")
         except Exception:
@@ -112,7 +120,7 @@ def start_update_checker(on_version_found):
 
         def notify():
             on_version_found(new_ver)
-        ImaDownloaderGUI._root_after(notify)
+        ImaDownloaderGUI._root_after(0, notify)
 
     t = threading.Thread(target=checker, daemon=True)
     t.start()
@@ -125,10 +133,11 @@ def download_and_apply_update(zip_url, new_ver, on_done, on_progress, on_open_gi
             zip_path = os.path.join(tempfile.gettempdir(), f"ima-update-{new_ver}.zip")
 
             def report(pct):
-                ImaDownloaderGUI._root_after(lambda: on_progress(pct))
+                ImaDownloaderGUI._root_after(0, lambda: on_progress(pct))
 
             report(0)
-            urllib.request.urlretrieve(zip_path, zip_path,
+            # FIX 2: 第一个参数是URL，第二个是保存路径（原错误：两个都是zip_path）
+            urllib.request.urlretrieve(zip_url, zip_path,
                                        reporthook=lambda *a: report(min(int(a[2]*100/a[3]), 99)))
             report(99)
 
@@ -139,16 +148,17 @@ def download_and_apply_update(zip_url, new_ver, on_done, on_progress, on_open_gi
             proj_dir = Path(sys.argv[0]).parent.resolve()
             for f in Path(tmp_dir).iterdir():
                 dst = proj_dir / f.name
-                if dst.is_dir() and not dst.is_file():
+                # FIX 3: 原条件 is_dir() and not is_file() 永远为False，直接改为 is_dir()
+                if dst.is_dir():
                     continue
                 shutil.copy2(f, dst)
 
             report(100)
-            ImaDownloaderGUI._root_after(on_open_github)
-            ImaDownloaderGUI._root_after(lambda: on_done(True))
+            ImaDownloaderGUI._root_after(0, on_open_github)
+            ImaDownloaderGUI._root_after(0, lambda: on_done(True))
 
         except Exception:
-            ImaDownloaderGUI._root_after(lambda: on_done(False))
+            ImaDownloaderGUI._root_after(0, lambda: on_done(False))
         finally:
             if tmp_dir:
                 try:
@@ -204,7 +214,8 @@ class DownloadTask:
             self.on_done(False)
 
     def _scan_and_download(self, api):
-        resp = api.get_share_info(self.share_id, limit=1, cursor="", folder_id="")
+        # FIX 4: 初始limit从1改为20，与后续分页保持一致，避免分页错位
+        resp = api.get_share_info(self.share_id, limit=20, cursor="", folder_id="")
         if resp.code != 0 or not resp.current_path:
             self.on_log("❌ 获取目录失败")
             return
@@ -266,7 +277,7 @@ class DownloadTask:
 # GUI
 # ============================================================
 class ImaDownloaderGUI:
-    _lang = "en"          # default to English
+    _lang = "zh"          # default to Chinese
     _root_after = None
 
     def __init__(self):
@@ -294,28 +305,11 @@ class ImaDownloaderGUI:
     # BUILD UI
     # ----------------------------------------------------------------
     def _build_ui(self):
-        bg, surface, accent, text, dim, warn = "#1e1e2e", "#2a2a3c", "#7c6af4", "#e8e8f0", "#666688", "#f5c542"
+        bg, surface, accent, text, dim, warn = "#1e2e2e", "#2a2a3c", "#7c6af4", "#e8e8f0", "#666688", "#f5c542"
 
-        # ── Title bar ──
-        top = Frame(self.root, bg=bg)
-        top.pack(fill="x", padx=16, pady=(8, 0))
-        top.columnconfigure(0, weight=1)
-
-        self._widgets["lbl_title"] = Label(top, text=s("title"),
-                                            font=("Microsoft YaHei", 15, "bold"),
-                                            fg=accent, bg=bg, anchor="w")
-        self._widgets["lbl_title"].grid(row=0, column=0)
-
-        btn_lang = Button(top, text=s("lang_label"),
-                          font=("Consolas", 8),
-                          bg=bg, fg=dim, relief="flat", bd=0,
-                          cursor="hand2", command=self._toggle_lang)
-        btn_lang.grid(row=0, column=1, padx=(0, 4))
-        self._widgets["btn_lang"] = btn_lang
-
-        # ── Update banner (hidden) ──
+        # ── Update banner (floating at top) ──
         bar = Frame(self.root, bg="#2d2a10", height=40)
-        bar.pack(fill="x", padx=12, pady=(6, 0))
+        bar.pack(fill="x", padx=12, pady=(8, 0))
         bar.pack_forget()
         bar.columnconfigure(0, weight=1)
         self._update_bar = bar
@@ -344,6 +338,30 @@ class ImaDownloaderGUI:
                                                bg="#2d2a10", fg=dim, relief="flat",
                                                cursor="hand2", command=self._dismiss_update)
         self._widgets["btn_dismiss"].pack(side="left", padx=2)
+
+        # ── Title bar ──
+        top = Frame(self.root, bg=bg)
+        top.pack(fill="x", padx=16, pady=(6, 0))
+        top.columnconfigure(0, weight=1)
+
+        self._widgets["lbl_title"] = Label(top, text=s("title"),
+                                            font=("Microsoft YaHei", 15, "bold"),
+                                            fg=accent, bg=bg, anchor="w")
+        self._widgets["lbl_title"].grid(row=0, column=0)
+
+        btn_lang = Button(top, text=s("lang_label"),
+                          font=("Consolas", 8),
+                          bg=bg, fg=dim, relief="flat", bd=0,
+                          cursor="hand2", command=self._toggle_lang)
+        btn_lang.grid(row=0, column=1, padx=(0, 4))
+        self._widgets["btn_lang"] = btn_lang
+
+        btn_check_update = Button(top, text=s("btn_check_update"),
+                                  font=("Microsoft YaHei", 9),
+                                  bg="#3d3d5c", fg=text, relief="flat",
+                                  cursor="hand2", command=self._check_update_manually)
+        btn_check_update.grid(row=0, column=2, padx=(0, 4))
+        self._widgets["btn_check_update"] = btn_check_update
 
         # ── Main card ──
         frame = Frame(self.root, bg=surface, padx=16, pady=10)
@@ -415,6 +433,7 @@ class ImaDownloaderGUI:
         w["lbl_title"].configure(text=s("title"))
         w["lbl_progress"].configure(text=s("ready"))
         w["btn_lang"].configure(text=s("lang_label"))
+        w["btn_check_update"].configure(text=s("btn_check_update"))
         w["btn_browse"].configure(text=s("browse"))
         w["btn_start"].configure(text=s("start"))
         w["btn_cancel"].configure(text=s("cancel"))
@@ -428,7 +447,7 @@ class ImaDownloaderGUI:
         self._text_share.delete("1.0", END)
         if was_placeholder or not cur:
             self._text_share.insert("1.0", s("share_ph"))
-            self._text_share.configure(fg=("#666688"))
+            self._text_share.configure(fg="#666688")
             self._has_placeholder = True
         else:
             self._text_share.insert("1.0", cur)
@@ -438,11 +457,13 @@ class ImaDownloaderGUI:
     # ----------------------------------------------------------------
     # UPDATE CHECK
     # ----------------------------------------------------------------
-    def _on_version_found(self, new_ver, err_msg=None):
+    # FIX 6: 移除未使用的 err_msg=None 参数
+    def _on_version_found(self, new_ver):
         if new_ver and self._compare_ver(new_ver):
             self._new_ver = new_ver
             self._widgets["lbl_update"].configure(text=s("update_avail", new_ver=new_ver))
-            self._update_bar.pack(fill="x", padx=12, pady=(6, 0))
+            # 使用 before 参数确保显示在标题栏之前
+            self._update_bar.pack(fill="x", padx=12, pady=(8, 0), side="top", before=self._widgets["lbl_title"].master)
 
     def _compare_ver(self, new_ver):
         def v(vstr):
@@ -461,6 +482,38 @@ class ImaDownloaderGUI:
     def _dismiss_update(self):
         self._update_dismissed = True
         self._update_bar.pack_forget()
+
+    def _check_update_manually(self):
+        self._widgets["btn_check_update"].configure(state=DISABLED, text="🔄 ...")
+        
+        def manual_checker():
+            new_ver = None
+            try:
+                req = urllib.request.Request(UPDATE_API, headers={"Accept": "application/vnd.github.v3+json"})
+                proxy_handler = urllib.request.ProxyHandler()
+                opener = urllib.request.build_opener(proxy_handler)
+                urllib.request.install_opener(opener)
+                
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read())
+                    new_ver = data.get("tag_name", "").lstrip("v")
+            except Exception:
+                pass
+
+            def notify():
+                if new_ver and self._compare_ver(new_ver):
+                    self._new_ver = new_ver
+                    self._widgets["lbl_update"].configure(text=s("update_avail", new_ver=new_ver))
+                    # 使用 before 参数确保显示在标题栏之前
+                    self._update_bar.pack(fill="x", padx=12, pady=(8, 0), side="top", before=self._widgets["lbl_title"].master)
+                    self._widgets["lbl_progress"].configure(text=s("update_avail", new_ver=new_ver))
+                else:
+                    self._widgets["lbl_progress"].configure(text="✅ 已是最新版本")
+                self._widgets["btn_check_update"].configure(state=NORMAL, text=s("btn_check_update"))
+            
+            ImaDownloaderGUI._root_after(0, notify)
+        
+        threading.Thread(target=manual_checker, daemon=True).start()
 
     def _open_github(self):
         import webbrowser

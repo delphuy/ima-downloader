@@ -3,7 +3,7 @@ chcp 65001 >nul 2>&1
 cd /d "%~dp0"
 
 REM ============================================================
-REM   IMA Knowledge Base Downloader v1.0.1 - Launcher
+REM   IMA Knowledge Base Downloader - Launcher
 REM ============================================================
 
 REM --- 1. Check Python ---
@@ -13,7 +13,7 @@ if errorlevel 1 (
     echo.
     echo [ERROR] Python not found.
     echo   https://www.python.org/downloads/
-    echo   Make sure to check Add Python to PATH during install.
+    echo   Make sure to check "Add Python to PATH" during install.
     echo.
     pause
     exit /b 1
@@ -39,14 +39,10 @@ if errorlevel 1 (
 )
 echo [OK] Dependencies ready
 
-REM --- 3. Launch GUI (hidden /min, then exit so CMD window vanishes) ---
+REM --- 3. Launch GUI (minimized, no CMD window) ---
 echo.
 echo [2/2] Launching GUI...
-if "%~1" == "" (
-    start "" /min cmd /d /c "pushd \"%~dp0\" && \"%~f0\" _launched && exit"
-    exit
-)
-pythonw.exe gui.py
+start "" /min pythonw.exe gui.py
 if errorlevel 1 (
     echo.
     echo [WARNING] pythonw failed, trying python...

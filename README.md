@@ -33,12 +33,37 @@ python --version
 
 ### 2. Launch
 
+**Windows:**  
 Double-click **`start.bat`**. On first run it will:
 1. Check Python availability
 2. Install the `requests` dependency (one-time only)
 3. Open the GUI
 
 Subsequent runs: just double-click `start.bat` — done.
+
+**macOS / Linux:**  
+Open Terminal, navigate to the project folder, then run:
+
+```bash
+# First run (install dependencies)
+pip install requests
+
+# Launch the GUI
+python gui.py
+```
+
+Or create a shell script for one-click launch:
+
+```bash
+# Create start.sh
+echo '#!/bin/bash' > start.sh
+echo 'pip install requests -q' >> start.sh
+echo 'python gui.py' >> start.sh
+chmod +x start.sh
+
+# Run
+./start.sh
+```
 
 ---
 

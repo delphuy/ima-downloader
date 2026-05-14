@@ -33,12 +33,37 @@ python --version
 
 ### 2. 启动程序
 
+**Windows 用户：**  
 双击 **`start.bat`**，首次运行会自动：
 1. 检查 Python 是否可用
 2. 安装 `requests` 依赖（仅首次需要）
 3. 弹出 GUI 窗口
 
 后续使用：直接双击 `start.bat` 即可。
+
+**macOS / Linux 用户：**  
+打开终端，进入项目文件夹，运行：
+
+```bash
+# 首次运行（安装依赖）
+pip install requests
+
+# 启动 GUI
+python gui.py
+```
+
+或者创建一键启动脚本：
+
+```bash
+# 创建 start.sh
+echo '#!/bin/bash' > start.sh
+echo 'pip install requests -q' >> start.sh
+echo 'python gui.py' >> start.sh
+chmod +x start.sh
+
+# 运行
+./start.sh
+```
 
 ---
 
