@@ -202,3 +202,19 @@ class FailedDownload:
 
     def __str__(self):
         return f"FailedDownload(url={self.download_url}, path={self.output_path})"
+
+
+# ── KnowledgeFile ──────────────────────────────────────────────
+@dataclass
+class KnowledgeFile:
+    """A downloadable file with its target relative path
+    (relative to the knowledge base root folder, e.g. '子目录/文件名.pdf').
+    Used by unified traverser + downloader for correct folder structure.
+    """
+    url: str
+    rel_path: Path
+    title: str
+    content_type: str = ""  # "链接类型", "文档类型", "文章类型" for thread grouping
+    # Future extension fields (kept minimal for now):
+    # source_path: str = ""
+    # file_size: str = ""

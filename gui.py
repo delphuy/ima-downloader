@@ -10,15 +10,19 @@ import tempfile
 import shutil
 import time
 from pathlib import Path
-from tkinter import Tk, Entry, Button, Label, Frame, END, DISABLED, NORMAL, filedialog, Text
+from tkinter import Tk, END, DISABLED, NORMAL, filedialog, Text
+import tkinter as tk
+from tkinter import ttk
 import tkinter.scrolledtext as scrolledtext
+import tkinter.messagebox as messagebox
 from api_service import ImaApiService
-from downloader import extract_download_url, sanitize_filename, download_single_file
+from downloader import FileDownloader, sanitize_name
+from traverser import collect_all_files, collect_grouped_files
 
 # ============================================================
 # VERSION & UPDATE CONFIG
 # ============================================================
-__VERSION__ = "1.0.2"
+__VERSION__ = "1.0.3"
 UPDATE_API = "https://api.github.com/repos/delphuy/ima-downloader/releases/latest"
 GITHUB_RELEASES = "https://github.com/delphuy/ima-downloader/releases"
 
@@ -88,6 +92,39 @@ LANG["zh"] = {
 
 def s(key, **kw):
     return LANG[ImaDownloaderGUI._lang][key].format(**kw)
+
+
+# ============================================================
+# THEME DEFINITIONS (Light default, Dark supported)
+# ============================================================
+THEMES = {
+    "light": {
+        "bg": "#f8fafc",
+        "surface": "#ffffff",
+        "accent": "#6366f1",
+        "text": "#1e293b",
+        "dim": "#64748b",
+        "warn": "#f59e0b",
+        "success": "#22c55e",
+        "error": "#ef4444",
+        "log_bg": "#f1f5f9",
+        "entry_bg": "#f8fafc",
+        "button_secondary_bg": "#e2e8f0",
+    },
+    "dark": {
+        "bg": "#0f172a",
+        "surface": "#1e293b",
+        "accent": "#6366f1",
+        "text": "#e2e8f0",
+        "dim": "#94a3b8",
+        "warn": "#f59e0b",
+        "success": "#22c55e",
+        "error": "#ef4444",
+        "log_bg": "#1e293b",
+        "entry_bg": "#1e293b",
+        "button_secondary_bg": "#334155",
+    }
+}
 
 
 # ============================================================
@@ -190,12 +227,15 @@ def extract_share_id(text):
 # DOWNLOAD TASK
 # ============================================================
 class DownloadTask:
-    def __init__(self, share_id, root_dir, on_log, on_progress, on_done):
+    def __init__(self, share_id, root_dir, on_log, on_progress, on_done, on_cat_progress=None, multi_thread=True, print_pdf=True):
         self.share_id = share_id
         self.root_dir = root_dir
         self.on_log = on_log
         self.on_progress = on_progress
         self.on_done = on_done
+        self.on_cat_progress = on_cat_progress
+        self.multi_thread = multi_thread
+        self.print_pdf = print_pdf
         self._cancelled = False
 
     def cancel(self):
@@ -214,63 +254,93 @@ class DownloadTask:
             self.on_done(False)
 
     def _scan_and_download(self, api):
-        # FIX 4: 初始limit从1改为20，与后续分页保持一致，避免分页错位
-        resp = api.get_share_info(self.share_id, limit=20, cursor="", folder_id="")
-        if resp.code != 0 or not resp.current_path:
+        # 使用分组收集器（按顶层分类分组）
+        def on_folder(rel: Path, name: str):
+            self.on_log(f"📁 {rel}")
+
+        root_name, all_files = collect_all_files(
+            api,
+            self.share_id,
+            on_folder=on_folder,
+            cancel_check=self.is_cancelled,
+        )
+        # group by type for multi-thread
+        grouped = {}
+        for kf in all_files:
+            ctype = kf.content_type or "文章类型"
+            if ctype not in grouped:
+                grouped[ctype] = []
+            grouped[ctype].append(kf)
+        if not root_name:
             self.on_log("❌ 获取目录失败")
             return
-        root_name = sanitize_filename(resp.current_path[0].name)
+
         root_path = Path(self.root_dir) / root_name
         root_path.mkdir(parents=True, exist_ok=True)
         self.on_log(s("folder", name=root_name))
 
-        existing = {f.name for f in root_path.iterdir() if f.is_file()}
+        # 正确的增量检查
+        existing = {
+            p.relative_to(root_path).as_posix()
+            for p in root_path.rglob("*")
+            if p.is_file()
+        }
         self.on_log(s("existing", n=len(existing)))
 
+        total_files = sum(len(fs) for fs in grouped.values())
         self.on_log(s("scan_files"))
-        all_files = []
-        self._collect_files(api, "", all_files)
-        self.on_log(s("total_files", n=len(all_files)))
+        self.on_log(s("total_files", n=total_files))
 
-        for i, item in enumerate(all_files, 1):
-            if self._cancelled:
-                self.on_log(s("cancelled"))
-                return
-            name = item['name']
-            self.on_progress(i, len(all_files), name)
-            self._download_one(item, root_path, existing)
-
-        self.on_log(s("done_ok"))
-
-    def _collect_files(self, api, folder_id, result):
-        cursor = ""
-        while True:
-            resp = api.get_share_info(self.share_id, limit=20, cursor=cursor, folder_id=folder_id)
-            if resp.code != 0:
-                break
-            for item in resp.knowledge_list:
-                if item.folder_info:
-                    self._collect_files(api, item.folder_info.folder_id, result)
-                else:
-                    url = extract_download_url(item.jump_url)
-                    name = sanitize_filename(item.title)
-                    if url and name:
-                        result.append({'url': url, 'name': name, 'folder_id': folder_id})
-            if resp.is_end or not resp.next_cursor:
-                break
-            cursor = resp.next_cursor
-
-    def _download_one(self, item, root_path, existing):
-        name = item['name']
-        if name in existing:
-            self.on_log(f"[跳过] {name}")
+        if self._cancelled:
+            self.on_log(s("cancelled"))
             return
-        out = root_path / name
-        try:
-            download_single_file(item['url'], out, on_log=None)
-            self.on_log(f"✅ {name}")
-        except Exception as e:
-            self.on_log(f"[FAIL] {name} — {e}")
+
+        if self.multi_thread:
+            self.on_log(f"发现 {len(grouped)} 个类型，将按类型并行下载")
+            # 使用分组下载：同一类型一个线程，多类型并行
+            dl = FileDownloader(max_workers=20, max_category_workers=3)
+            dl.set_logger(self.on_log)
+
+            def progress_wrapper(current, total, name):
+                self.on_progress(current, total, name)
+
+            def cat_progress(cat_name, cat_cur, cat_tot, name):
+                self.on_log(f"[{cat_name}] {cat_cur}/{cat_tot} {name}")
+                if self.on_cat_progress:
+                    self.on_cat_progress(cat_name, cat_cur, cat_tot, name)
+
+            failures = dl.download_grouped_files(
+                grouped,
+                root_path,
+                on_progress=progress_wrapper,
+                on_category_progress=cat_progress,
+                cancel_check=self.is_cancelled,
+                existing_rels=existing,
+                enable_print_pdf=self.print_pdf,
+            )
+        else:
+            # 多线程关闭：保留小并发
+            self.on_log("多线程已关闭，使用小并发（最多3个文件同时下载）")
+            dl = FileDownloader(max_workers=3)
+            dl.set_logger(self.on_log)
+
+            def progress_wrapper(current, total, name):
+                self.on_progress(current, total, name)
+
+            failures = dl.download_knowledge_files(
+                [f for fs in grouped.values() for f in fs],  # flat
+                root_path,
+                on_progress=progress_wrapper,
+                cancel_check=self.is_cancelled,
+                existing_rels=existing,
+                enable_print_pdf=self.print_pdf,
+            )
+
+        for f in failures:
+            self.on_log(f"[FAIL] {f.output_path} — 下载失败")
+
+        if not self._cancelled:
+            self.on_log(s("done_ok"))
 
 
 # ============================================================
@@ -282,20 +352,42 @@ class ImaDownloaderGUI:
 
     def __init__(self):
         self.root = Tk()
+        self.root.withdraw()  # hide until fully configured to prevent flash at default position
+        self.root.geometry("950x680")  # set early size to avoid default small/long window
         ImaDownloaderGUI._root_after = self.root.after
         self.root.title("IMA Knowledge Base Downloader")
-        self.root.geometry("800x680")
-        self.root.configure(bg="#1e1e2e")
         self._task = None
         self._has_placeholder = True
         self._update_dismissed = False
         self._new_ver = None
+        self.current_theme = "light"  # Default light mode as per spec
+
+        # Load persisted theme
+        try:
+            if os.path.exists("theme.txt"):
+                with open("theme.txt") as f:
+                    saved = f.read().strip()
+                    if saved in ("light", "dark"):
+                        self.current_theme = saved
+        except:
+            pass
 
         # All widgets that need language refresh
         self._widgets = {}
+        self._category_widgets = {}  # For multi-thread visibility
+
+        # Checkboxes for options (default checked)
+        self.multi_thread_var = tk.BooleanVar(value=True)
+        self.print_pdf_var = tk.BooleanVar(value=True)
+        self.multi_thread_var.trace_add("write", self._on_multi_thread_changed)
+        self.print_pdf_var.trace_add("write", lambda *args: None)  # placeholder if needed later
 
         self._build_ui()
+        self.apply_theme(self.current_theme)  # Apply (light by default)
+        self._on_multi_thread_changed()  # set initial visibility based on checkbox
         self._entry_dir.insert(0, str(Path("downloads").resolve()))
+
+        self._center_window()
 
         # Show ready silently, start background update check after 5s
         self._widgets["lbl_progress"].configure(text=s("ready"))
@@ -305,123 +397,321 @@ class ImaDownloaderGUI:
     # BUILD UI
     # ----------------------------------------------------------------
     def _build_ui(self):
-        bg, surface, accent, text, dim, warn = "#1e2e2e", "#2a2a3c", "#7c6af4", "#e8e8f0", "#666688", "#f5c542"
+        self.root.configure(bg="#f8fafc")  # temporary, will be overridden by apply_theme
 
-        # ── Update banner (floating at top) ──
-        bar = Frame(self.root, bg="#2d2a10", height=40)
+        # 应用 ttk 样式 (will be reconfigured in apply_theme)
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        # Define flat button styles (no borders)
+        style.configure("Flat.TButton", relief="flat", borderwidth=0, padding=(8, 5), font=("Microsoft YaHei", 10))
+        style.configure("PrimaryFlat.TButton", relief="flat", borderwidth=0, padding=(10, 6), font=("Microsoft YaHei", 11, "bold"))
+
+        # ── Update banner ──
+        bar = ttk.Frame(self.root)
         bar.pack(fill="x", padx=12, pady=(8, 0))
         bar.pack_forget()
-        bar.columnconfigure(0, weight=1)
         self._update_bar = bar
 
-        self._widgets["lbl_update"] = Label(bar, font=("Microsoft YaHei", 10),
-                                             fg=warn, bg="#2d2a10", anchor="w")
-        self._widgets["lbl_update"].grid(row=0, column=0, padx=8, pady=6, sticky="ew")
+        self._widgets["lbl_update"] = ttk.Label(bar, text="", style="TLabel")
+        self._widgets["lbl_update"].pack(side="left", padx=8)
 
-        btn_row = Frame(bar, bg="#2d2a10")
-        btn_row.grid(row=0, column=1, padx=(0, 4), pady=4, sticky="ns")
-
-        self._widgets["btn_update"] = Button(btn_row, text=s("btn_update"),
-                                             font=("Microsoft YaHei", 9, "bold"),
-                                             bg=accent, fg="white", relief="flat",
-                                             cursor="hand2", command=self._do_update)
+        btn_row = ttk.Frame(bar)
+        btn_row.pack(side="right", padx=4)
+        self._widgets["btn_update"] = ttk.Button(btn_row, text=s("btn_update"), style="PrimaryFlat.TButton", command=self._do_update)
         self._widgets["btn_update"].pack(side="left", padx=2)
-
-        self._widgets["btn_github"] = Button(btn_row, text=s("open_github"),
-                                              font=("Microsoft YaHei", 9),
-                                              bg="#3d3d5c", fg=text, relief="flat",
-                                              cursor="hand2", command=self._open_github)
+        self._widgets["btn_github"] = ttk.Button(btn_row, text=s("open_github"), style="Flat.TButton", command=self._open_github)
         self._widgets["btn_github"].pack(side="left", padx=2)
-
-        self._widgets["btn_dismiss"] = Button(btn_row, text=s("update_dismiss"),
-                                               font=("Consolas", 9),
-                                               bg="#2d2a10", fg=dim, relief="flat",
-                                               cursor="hand2", command=self._dismiss_update)
+        self._widgets["btn_dismiss"] = ttk.Button(btn_row, text=s("update_dismiss"), style="Flat.TButton", command=self._dismiss_update)
         self._widgets["btn_dismiss"].pack(side="left", padx=2)
 
-        # ── Title bar ──
-        top = Frame(self.root, bg=bg)
-        top.pack(fill="x", padx=16, pady=(6, 0))
-        top.columnconfigure(0, weight=1)
+        # ── Header ──
+        header = ttk.Frame(self.root)
+        header.pack(fill="x", padx=16, pady=(4, 2))
+        self._widgets["lbl_title"] = ttk.Label(header, text=s("title"), style="Title.TLabel")
+        self._widgets["lbl_title"].pack(side="left")
 
-        self._widgets["lbl_title"] = Label(top, text=s("title"),
-                                            font=("Microsoft YaHei", 15, "bold"),
-                                            fg=accent, bg=bg, anchor="w")
-        self._widgets["lbl_title"].grid(row=0, column=0)
+        self._widgets["btn_lang"] = ttk.Button(header, text=s("lang_label"), style="Flat.TButton", command=self._toggle_lang)
+        self._widgets["btn_lang"].pack(side="right", padx=4)
+        self._widgets["btn_check_update"] = ttk.Button(header, text=s("btn_check_update"), style="Flat.TButton", command=self._check_update_manually)
+        self._widgets["btn_check_update"].pack(side="right", padx=4)
 
-        btn_lang = Button(top, text=s("lang_label"),
-                          font=("Consolas", 8),
-                          bg=bg, fg=dim, relief="flat", bd=0,
-                          cursor="hand2", command=self._toggle_lang)
-        btn_lang.grid(row=0, column=1, padx=(0, 4))
-        self._widgets["btn_lang"] = btn_lang
+        # Theme toggle button (added per spec)
+        self._widgets["btn_theme"] = ttk.Button(header, text="☀️ 浅色", style="Flat.TButton", command=self.toggle_theme)
+        self._widgets["btn_theme"].pack(side="right", padx=4)
 
-        btn_check_update = Button(top, text=s("btn_check_update"),
-                                  font=("Microsoft YaHei", 9),
-                                  bg="#3d3d5c", fg=text, relief="flat",
-                                  cursor="hand2", command=self._check_update_manually)
-        btn_check_update.grid(row=0, column=2, padx=(0, 4))
-        self._widgets["btn_check_update"] = btn_check_update
+        # ── Input Card ──
+        card = ttk.Frame(self.root, style="Card.TFrame", padding=12)
+        card.pack(fill="x", padx=12, pady=4)
 
-        # ── Main card ──
-        frame = Frame(self.root, bg=surface, padx=16, pady=10)
-        frame.pack(fill="x", padx=12, pady=(6, 0))
-
-        Label(frame, text=s("share_label"),
-              fg=text, bg=surface).grid(row=0, column=0, sticky="w")
-
-        self._text_share = Text(frame, font=("Microsoft YaHei", 10),
-                                bg="#111120", fg=dim,
-                                insertbackground=accent,
-                                height=5, wrap="word", padx=6, pady=4)
-        self._text_share.grid(row=1, column=0, columnspan=2, sticky="ew")
+        ttk.Label(card, text=s("share_label")).pack(anchor="w", pady=(0, 2))
+        self._text_share = Text(card, font=("Microsoft YaHei", 10), relief="flat", padx=8, pady=6,
+                                height=4, wrap="word")
+        self._text_share.pack(fill="x")
         self._text_share.insert("1.0", s("share_ph"))
         self._text_share.bind("<FocusIn>", self._on_share_focus_in)
         self._text_share.bind("<FocusOut>", self._on_share_focus_out)
-        frame.columnconfigure(0, weight=1)
 
-        Label(frame, text=s("dir_label"),
-              fg=text, bg=surface).grid(row=2, column=0, sticky="w", pady=(10, 0))
+        dir_frame = ttk.Frame(card)
+        dir_frame.pack(fill="x", pady=(6, 0))
+        ttk.Label(dir_frame, text=s("dir_label")).pack(side="left")
+        self._entry_dir = ttk.Entry(dir_frame, font=("Consolas", 10))
+        self._entry_dir.pack(side="left", fill="x", expand=True, padx=(8, 4), ipady=3)
+        self._widgets["btn_browse"] = ttk.Button(dir_frame, text=s("browse"), style="Flat.TButton", command=self._browse)
+        self._widgets["btn_browse"].pack(side="right")
 
-        self._entry_dir = Entry(frame, font=("Consolas", 10), bg="#111120", fg=text)
-        self._entry_dir.grid(row=3, column=0, sticky="ew", ipady=4)
+        btns = ttk.Frame(card)
+        btns.pack(pady=(8, 2))
 
-        self._widgets["btn_browse"] = Button(frame, text=s("browse"),
-                                              command=self._browse, bg="#3d3d5c", fg=text)
-        self._widgets["btn_browse"].grid(row=3, column=1, padx=(6, 0))
+        # Checkboxes left of Start button
+        cb_multi = ttk.Checkbutton(btns, text="多线程", variable=self.multi_thread_var, style="TCheckbutton")
+        cb_multi.pack(side="left", padx=(0, 8))
+        self._widgets["cb_multi"] = cb_multi
+        cb_print = ttk.Checkbutton(btns, text="网页打印为pdf", variable=self.print_pdf_var, style="TCheckbutton")
+        cb_print.pack(side="left", padx=(0, 8))
+        self._widgets["cb_print"] = cb_print
 
-        btn_frame = Frame(frame, bg=surface)
-        btn_frame.grid(row=4, column=0, columnspan=2, pady=(15, 5))
+        self._widgets["btn_start"] = ttk.Button(btns, text=s("start"), style="PrimaryFlat.TButton", command=self._start, width=18)
+        self._widgets["btn_start"].pack(side="left", padx=6)
+        self._widgets["btn_cancel"] = ttk.Button(btns, text=s("cancel"), style="Flat.TButton", command=self._cancel, width=12)
+        self._widgets["btn_cancel"].pack(side="left", padx=6)
 
-        self._widgets["btn_start"] = Button(btn_frame, text=s("start"),
-                                             command=self._start,
-                                             bg=accent, fg="white",
-                                             font=("Microsoft YaHei", 10, "bold"), padx=20)
-        self._widgets["btn_start"].pack(side="left", padx=5)
-
-        self._widgets["btn_cancel"] = Button(btn_frame, text=s("cancel"),
-                                              bg="#3d3d5c", fg=text, padx=20)
-        self._widgets["btn_cancel"].pack(side="left", padx=5)
+        # Explanation text below buttons - full width, minimal wrap, tight
+        note_text = "勾选多线程后，会多耗用一些电脑资源，若电脑资源紧张，可取消勾选；若不希望将网页url等下载为pdf，可取消打印勾选。"
+        note_label = ttk.Label(card, text=note_text, font=("Microsoft YaHei", 8), wraplength=900, foreground="#64748b")
+        note_label.pack(fill="x", pady=(2, 0))
+        self._widgets["note_label"] = note_label
 
         # ── Progress ──
-        self._widgets["lbl_progress"] = Label(self.root, text=s("ready"),
-                                              font=("Consolas", 12, "bold"),
-                                              fg=accent, bg=bg, height=2, anchor="w")
-        self._widgets["lbl_progress"].pack(fill="x", padx=16, pady=(8, 4))
+        prog_frame = ttk.Frame(self.root)
+        prog_frame.pack(fill="x", padx=16, pady=(2, 1))
+        self._widgets["lbl_progress"] = ttk.Label(prog_frame, text=s("ready"), font=("Consolas", 11, "bold"))
+        self._widgets["lbl_progress"].pack(anchor="w")
 
-        sep = Frame(self.root, bg=accent, height=2)
-        sep.pack(fill="x", padx=12)
+        self._progress_bar = ttk.Progressbar(prog_frame, mode="determinate", maximum=100)
+        self._progress_bar.pack(fill="x", pady=(4, 0))
+
+        # ── Category Progress Section (for multi-thread visibility, per spec) ──
+        self._category_frame = ttk.LabelFrame(self.root, text="进行中的类型", padding=4)
+        self._category_frame.pack(fill="x", padx=12, pady=(1, 1))
+
+        # Use a canvas + inner frame for potential scrolling if many categories
+        canvas_bg = THEMES.get(self.current_theme, THEMES['light'])['log_bg']
+        self._cat_canvas = tk.Canvas(self._category_frame, height=90, highlightthickness=0, bg=canvas_bg)
+        self._cat_inner = ttk.Frame(self._cat_canvas)
+        cat_scroll = ttk.Scrollbar(self._category_frame, orient="vertical", command=self._cat_canvas.yview)
+        self._cat_canvas.configure(yscrollcommand=cat_scroll.set)
+
+        self._cat_canvas.pack(side="left", fill="both", expand=True)
+        cat_scroll.pack(side="right", fill="y")
+        self._cat_canvas.create_window((0, 0), window=self._cat_inner, anchor="nw")
+
+        def _on_cat_frame_config(event):
+            self._cat_canvas.configure(scrollregion=self._cat_canvas.bbox("all"))
+        self._cat_inner.bind("<Configure>", _on_cat_frame_config)
+
+        self._category_widgets = {}  # cat_name -> {'name': Label, 'bar': Progressbar, 'status': Label}
 
         # ── Log ──
+        log_label = ttk.Label(self.root, text="日志", font=("Microsoft YaHei", 9))
+        log_label.pack(anchor="w", padx=16, pady=(2, 1))
+
         self._log_widget = scrolledtext.ScrolledText(
-            self.root, font=("Consolas", 9),
-            bg="#111120", fg="#d4d4e8", state="disabled",
-            wrap="word", padx=10, pady=6, height=4,
+            self.root, font=("Consolas", 9), relief="flat", padx=8, pady=3
         )
-        self._log_widget.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self._log_widget.tag_configure("ok", foreground="#6ccf7e")
-        self._log_widget.tag_configure("warn", foreground="#f5c542")
-        self._log_widget.tag_configure("err", foreground="#f4706c")
+        self._log_widget.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        self._log_widget.tag_configure("ok", foreground="#22c55e")
+        self._log_widget.tag_configure("warn", foreground="#f59e0b")
+        self._log_widget.tag_configure("err", foreground="#ef4444")
+        self._log_widget.tag_configure("pdf", foreground="#6366f1")
+
+    def apply_theme(self, theme_name):
+        """Apply light or dark theme (per spec)."""
+        if theme_name not in THEMES:
+            theme_name = "light"
+        self.current_theme = theme_name
+        theme = THEMES[theme_name]
+
+        self.root.configure(bg=theme["bg"])
+
+        style = ttk.Style()
+        # Base
+        style.configure("TFrame", background=theme["surface"])
+        style.configure("Card.TFrame", background=theme["surface"])
+        style.configure("TLabel", background=theme["surface"], foreground=theme["text"], font=("Microsoft YaHei", 10))
+        style.configure("Title.TLabel", background=theme["bg"], foreground=theme["accent"], font=("Microsoft YaHei", 16, "bold"))
+        style.configure("TLabelframe.Label", background=theme["surface"], foreground=theme["dim"], font=("Microsoft YaHei", 9))
+        style.configure("TLabelframe", background=theme["surface"], foreground=theme["text"])
+        style.configure("TLabelframe.Label", background=theme["surface"], foreground=theme["dim"], font=("Microsoft YaHei", 9))
+
+        # Flat buttons (no borders)
+        style.configure("Flat.TButton",
+            background=theme["button_secondary_bg"],
+            foreground=theme["text"],
+            relief="flat",
+            borderwidth=0,
+            padding=(6, 4),
+            font=("Microsoft YaHei", 10)
+        )
+        style.map("Flat.TButton",
+            background=[("active", theme["accent"]), ("pressed", theme["accent"])],
+            foreground=[("active", "white"), ("pressed", "white")]
+        )
+
+        style.configure("PrimaryFlat.TButton",
+            background=theme["accent"],
+            foreground="white",
+            relief="flat",
+            borderwidth=0,
+            padding=(8, 5),
+            font=("Microsoft YaHei", 10, "bold")
+        )
+        style.map("PrimaryFlat.TButton",
+            background=[("active", "#4f46e5"), ("pressed", "#4338ca")]
+        )
+
+        # Style for checkboxes to better match flat UI
+        style.configure("TCheckbutton",
+            background=theme["surface"],
+            foreground=theme["text"],
+            font=("Microsoft YaHei", 10),
+            relief="flat",
+            borderwidth=0,
+            padding=2,
+            indicatorbackground=theme["surface"],
+            indicatorforeground=theme["accent"]
+        )
+        style.map("TCheckbutton",
+            background=[("active", theme["surface"])],
+            foreground=[("active", theme["accent"])],
+            indicatorbackground=[("selected", theme["accent"]), ("active", theme["surface"])]
+        )
+
+        style.configure("TEntry", fieldbackground=theme["entry_bg"], foreground=theme["text"], font=("Consolas", 11))
+        style.configure("Horizontal.TProgressbar", background=theme["accent"], troughcolor=theme["log_bg"])
+
+        # Raw widgets
+        self._text_share.configure(bg=theme["log_bg"], fg=theme["text"], insertbackground=theme["accent"])
+        self._log_widget.configure(bg=theme["log_bg"], fg=theme["text"])
+
+        # Update toggle button text
+        if "btn_theme" in self._widgets:
+            self._widgets["btn_theme"].configure(text="🌙 深色" if theme_name == "light" else "☀️ 浅色")
+
+        # Refresh placeholder color if active
+        if hasattr(self, '_has_placeholder') and self._has_placeholder:
+            self._text_share.configure(fg=theme["dim"])
+
+        # Refresh existing category rows
+        for w in self._category_widgets.values():
+            w["name"].configure(foreground=theme["text"])
+            w["status"].configure(foreground=theme["dim"])
+            w["current"].configure(foreground=theme["dim"])
+
+        # Canvas bg
+        if hasattr(self, "_cat_canvas"):
+            self._cat_canvas.configure(bg=theme["log_bg"])
+
+        # Force style on checkboxes
+        for cb_key in ["cb_multi", "cb_print"]:
+            if cb_key in self._widgets:
+                self._widgets[cb_key].configure(style="TCheckbutton")
+
+        # Update note color and font
+        if "note_label" in self._widgets:
+            self._widgets["note_label"].configure(foreground=theme["dim"], font=("Microsoft YaHei", 8))
+
+    def _on_multi_thread_changed(self, *args):
+        if self.multi_thread_var.get():
+            try:
+                # re-pack before the log to maintain layout order
+                self._category_frame.pack(fill="x", padx=12, pady=(4, 2), before=self._log_widget)
+            except Exception:
+                self._category_frame.pack(fill="x", padx=12, pady=(4, 2))
+            # ensure inner canvas is visible and scrolled
+            if hasattr(self, '_cat_canvas'):
+                self._cat_canvas.pack(side="left", fill="both", expand=True)
+                self._cat_canvas.configure(scrollregion=self._cat_canvas.bbox("all") or (0,0,0,120))
+        else:
+            self._category_frame.pack_forget()
+        self.root.update_idletasks()
+        self.root.update()  # force refresh
+
+    def _center_window(self):
+        self.root.update_idletasks()
+        # Wider window, better center (slightly above center for titlebar/taskbar)
+        width = 1000
+        height = 650
+        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
+        y = max(20, (self.root.winfo_screenheight() // 2) - (height // 2) - 30)
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
+        self.root.deiconify()  # show after fully positioned to prevent initial flash at default (left) position
+
+
+        # Update category section if exists
+        if hasattr(self, '_category_frame'):
+            self._category_frame.configure(style="TLabelframe")
+
+    def toggle_theme(self):
+        new_theme = "dark" if self.current_theme == "light" else "light"
+        self.apply_theme(new_theme)
+        # Persist
+        try:
+            with open("theme.txt", "w") as f:
+                f.write(new_theme)
+        except:
+            pass
+
+    # ----------------------------------------------------------------
+    # CATEGORY PROGRESS UI (multi-thread visibility per spec)
+    # ----------------------------------------------------------------
+    def _get_or_create_category_row(self, cat_name):
+        if cat_name in self._category_widgets:
+            return self._category_widgets[cat_name]
+
+        row = ttk.Frame(self._cat_inner)
+        row.pack(fill="x", pady=2)
+
+        name_label = ttk.Label(row, text=cat_name[:20], width=22, anchor="w")
+        name_label.pack(side="left")
+
+        bar = ttk.Progressbar(row, length=200, mode="determinate", maximum=100)
+        bar.pack(side="left", padx=6)
+
+        status_label = ttk.Label(row, text="0/0", width=12)
+        status_label.pack(side="left", padx=4)
+
+        current_label = ttk.Label(row, text="", width=35, anchor="w")
+        current_label.pack(side="left")
+
+        widgets = {
+            "row": row,
+            "name": name_label,
+            "bar": bar,
+            "status": status_label,
+            "current": current_label
+        }
+        self._category_widgets[cat_name] = widgets
+        if hasattr(self, '_cat_canvas'):
+            self._cat_canvas.configure(scrollregion=self._cat_canvas.bbox("all"))
+        return widgets
+
+    def _update_category_progress_ui(self, cat_name, current, total, filename=""):
+        widgets = self._get_or_create_category_row(cat_name)
+        pct = int(current * 100 / total) if total > 0 else 0
+        widgets["bar"]["value"] = pct
+        widgets["status"].configure(text=f"{current}/{total}")
+        widgets["current"].configure(text=filename[:40] if filename else "")
+        # update scroll
+        if hasattr(self, '_cat_canvas'):
+            self._cat_canvas.configure(scrollregion=self._cat_canvas.bbox("all"))
+
+    def _clear_category(self, cat_name):
+        if cat_name in self._category_widgets:
+            self._category_widgets[cat_name]["row"].destroy()
+            del self._category_widgets[cat_name]
+            if hasattr(self, '_cat_canvas'):
+                self._cat_canvas.configure(scrollregion=self._cat_canvas.bbox("all"))
 
     # ----------------------------------------------------------------
     # LANGUAGE TOGGLE — refresh all UI strings
@@ -445,14 +735,18 @@ class ImaDownloaderGUI:
         was_placeholder = self._has_placeholder
         cur = self._text_share.get("1.0", END).strip()
         self._text_share.delete("1.0", END)
+        theme = THEMES[self.current_theme]
         if was_placeholder or not cur:
             self._text_share.insert("1.0", s("share_ph"))
-            self._text_share.configure(fg="#666688")
+            self._text_share.configure(fg=theme["dim"])
             self._has_placeholder = True
         else:
             self._text_share.insert("1.0", cur)
-            self._text_share.configure(fg="#e8e8f0")
+            self._text_share.configure(fg=theme["text"])
             self._has_placeholder = False
+
+        # Re-apply theme to ensure all colors are correct after language change
+        self.apply_theme(self.current_theme)
 
     # ----------------------------------------------------------------
     # UPDATE CHECK
@@ -554,7 +848,8 @@ class ImaDownloaderGUI:
     def _on_share_focus_in(self, _):
         if self._has_placeholder:
             self._text_share.delete("1.0", END)
-            self._text_share.configure(fg="#e8e8f0")
+            theme = THEMES[self.current_theme]
+            self._text_share.configure(fg=theme["text"])
             self._has_placeholder = False
 
     def _on_share_focus_out(self, _):
@@ -562,7 +857,8 @@ class ImaDownloaderGUI:
         if not content:
             self._text_share.delete("1.0", END)
             self._text_share.insert("1.0", s("share_ph"))
-            self._text_share.configure(fg="#666688")
+            theme = THEMES[self.current_theme]
+            self._text_share.configure(fg=theme["dim"])
             self._has_placeholder = True
 
     def _get_share_text(self):
@@ -582,6 +878,12 @@ class ImaDownloaderGUI:
         self._entry_dir.configure(state=s_state)
         self._widgets["btn_browse"].configure(state=s_state)
         self._widgets["btn_start"].configure(state=s_state)
+        self._widgets["btn_cancel"].configure(state=s_state)
+        # disable options during download
+        if "cb_multi" in self._widgets:
+            self._widgets["cb_multi"].configure(state=s_state)
+        if "cb_print" in self._widgets:
+            self._widgets["cb_print"].configure(state=s_state)
 
     def _add_log(self, msg):
         self._log_widget.configure(state="normal")
@@ -589,8 +891,11 @@ class ImaDownloaderGUI:
         self._log_widget.configure(state="disabled")
 
     def _on_progress(self, current, total, name):
-        self.root.after(0, lambda: self._widgets["lbl_progress"].configure(
-            text=f"[{current}/{total}] {name}"))
+        pct = int(current * 100 / total) if total > 0 else 0
+        def update():
+            self._widgets["lbl_progress"].configure(text=f"[{current}/{total}] {name}")
+            self._progress_bar["value"] = pct
+        self.root.after(0, update)
 
     def _on_done(self, ok):
         self.root.after(0, lambda: self._finish(ok))
@@ -598,6 +903,10 @@ class ImaDownloaderGUI:
     def _finish(self, ok):
         self._set_ui(True)
         self._widgets["lbl_progress"].configure(text=s("done_ok") if ok else s("done_fail"))
+        self._progress_bar["value"] = 100 if ok else 0
+        # Clear category rows when done
+        for cat in list(self._category_widgets.keys()):
+            self._clear_category(cat)
 
     # ----------------------------------------------------------------
     # ACTIONS
@@ -615,8 +924,14 @@ class ImaDownloaderGUI:
         self._log_widget.delete("1.0", END)
         self._log_widget.configure(state="disabled")
 
+        # Clear previous category rows
+        for cat in list(self._category_widgets.keys()):
+            self._clear_category(cat)
+
         self._task = DownloadTask(sid, save, self._add_log,
-                                  self._on_progress, self._on_done)
+                                  self._on_progress, self._on_done, self._update_category_progress_ui,
+                                  multi_thread=self.multi_thread_var.get(),
+                                  print_pdf=self.print_pdf_var.get())
         threading.Thread(target=self._task.run, daemon=True).start()
 
     def _cancel(self):
@@ -629,4 +944,13 @@ class ImaDownloaderGUI:
 
 
 if __name__ == "__main__":
-    ImaDownloaderGUI().run()
+    try:
+        ImaDownloaderGUI().run()
+    except Exception as e:
+        import traceback
+        err = traceback.format_exc()
+        try:
+            messagebox.showerror("IMA Downloader Error", f"启动失败:\n{err}")
+        except:
+            print("启动失败:", err)
+        raise

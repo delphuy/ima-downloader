@@ -9,10 +9,11 @@ A cross-platform desktop tool to recursively download files from IMA Knowledge B
 ## Features
 
 - 📋 Paste a share link — `share_id` extracted automatically
-- 📁 Recursive traversal of all subfolders
-- ⚡ Concurrent downloads (20 threads)
-- 🔄 Incremental download: skip existing files, resume anytime
-- 🌙 Dark-themed GUI, one-click startup
+- 📁 Recursive traversal grouped by top-level categories (parallel categories, sequential within category)
+- ⚡ Smart concurrency + browser "Print to PDF" for link-type content
+- 🔄 Incremental download
+- 🎨 Modern clean GUI (ttk styled, progress bar)
+- 🌙 Dark theme, one-click start.bat
 
 ---
 
@@ -93,14 +94,15 @@ The program scans the save directory before each run. Already-downloaded files a
 
 ```
 .
-├── gui.py           # GUI main entry (start via start.bat)
+├── gui.py           # Modern GUI (ttk)
 ├── api_service.py   # IMA API wrapper
-├── downloader.py    # Download engine (concurrent + resume)
+├── downloader.py    # Download engine (grouped concurrency + PDF print)
 ├── models.py        # Data models
-├── sync_manager.py  # Recursive traversal + retry logic
-├── main.py          # CLI entry point
-├── requirements.txt # Python dependencies (requests only)
-├── start.bat        # One-click launcher
+├── traverser.py     # Collection + grouping
+├── sync_manager.py  # CLI
+├── main.py          # CLI entry
+├── requirements.txt # requests only
+├── start.bat        # Launcher
 └── README.md        # This file
 ```
 
@@ -108,11 +110,12 @@ The program scans the save directory before each run. Already-downloaded files a
 
 ## Configuration
 
-To tweak concurrency or timeouts, edit `downloader.py`:
+Edit `downloader.py` for advanced tuning:
 
 ```python
-TIMEOUT = 30       # HTTP request timeout (seconds)
-MAX_WORKERS = 20   # Concurrent download threads
+TIMEOUT = 30                  # HTTP timeout
+MAX_WORKERS = 20              # File threads
+MAX_CATEGORY_WORKERS = 6      # Parallel categories (sequential inside each)
 ```
 
 ---
@@ -120,7 +123,11 @@ MAX_WORKERS = 20   # Concurrent download threads
 ## FAQ
 
 **Q: `start.bat` flashes and disappears with no window?**
-A: Right-click → Edit `start.bat`, add `pause` on the last line, save and re-run to see the error. Most common cause: Python is not in PATH.
+A: Common causes:
+1. Python was installed without tcl/tk (reinstall and check "tcl/tk and IDLE").
+2. Silent error.
+   - Edit start.bat and add `pause` at the end, or run `python gui.py` directly from console to see errors.
+The launcher now has better fallback and the GUI shows a message box on fatal errors.
 
 **Q: "Cannot extract share_id"?**
 A: Make sure the copied link contains `shareId=xxxxxxxx`. Paste the full text as-is — the program extracts the ID automatically.
@@ -130,6 +137,12 @@ A: No. Already-present files are skipped automatically on re-run.
 
 **Q: A file failed to download. What now?**
 A: The log shows `[FAIL] filename — error reason`. Fix the issue and re-run — already-downloaded files won't be duplicated.
+
+**Q: What about link/URL content?**
+A: It prefers to "print" the page to PDF using headless browser (like Ctrl+P → Save as PDF). Falls back to a clickable .url shortcut if it fails (e.g. verification page).
+
+**Q: Faster for large collections?**
+A: Yes — files are grouped by top-level category. Same category downloads in one thread; different categories run in parallel (default max 6 categories).
 
 ---
 

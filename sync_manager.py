@@ -1,13 +1,13 @@
 # sync_manager.py - 同步管理器
 # 对应 Java 版本的 SyncManager.java，负责递归遍历文件夹和协调下载
 
-import re
-import time
 from pathlib import Path
 from typing import List, Optional
-from models import ShareInfoResponse, KnowledgeItem, FailedDownload
+
 from api_service import ImaApiService
-from downloader import FileDownloader, sanitize_filename, download_single_file
+from downloader import FileDownloader, download_single_file
+from models import FailedDownload
+from traverser import collect_all_files, collect_grouped_files
 
 
 class SyncManager:
@@ -31,26 +31,36 @@ class SyncManager:
     # ── 公开接口 ───────────────────────────────────────────────
 
     def start_sync(self, root_dir: str = "downloads") -> None:
-        """启动整个同步和下载过程。"""
+        """启动整个同步和下载过程（使用统一 traverser + download_knowledge_files）。"""
         print("--- Starting Synchronization Process ---")
 
         try:
-            # 1. 获取根目录信息
-            initial_resp = self.api.get_share_info(self.share_id, limit=1, cursor="", folder_id="")
-            if initial_resp.code != 0 or not initial_resp.current_path:
-                print("❌ Failed to get initial folder info. Aborting.")
-                return
+            # 使用统一收集器获取 root_name + 带 rel_path 的文件列表
+            def on_folder(rel: Path, name: str):
+                print(f"📁 {rel}")
 
-            # 2. 创建根目录
-            root_name = sanitize_name(initial_resp.current_path[0].name)
+            root_name, grouped = collect_grouped_files(
+                self.api,
+                self.share_id,
+                on_folder=on_folder,
+            )
+
             root_path = Path(root_dir) / root_name
             root_path.mkdir(parents=True, exist_ok=True)
             print(f"Root directory: {root_path.resolve()}")
+            total = sum(len(v) for v in grouped.values())
+            print(f"Found {total} files in {len(grouped)} types. Starting grouped download...")
 
-            # 3. 递归处理
-            self._process_folder("", root_path)
+            # 使用分组下载
+            self.downloader.max_category_workers = 3
+            failures = self.downloader.download_grouped_files(
+                grouped,
+                root_path,
+                enable_print_pdf=True,
+            )
+            self._all_failed.extend(failures)
 
-            # 4. 失败重试（串行）
+            # 失败重试（串行）
             self._retry_failed()
 
             self._print_final_report()
@@ -61,55 +71,7 @@ class SyncManager:
         except Exception as e:
             print(f"\n❌ Critical error: {e}")
 
-    # ── 递归处理 ───────────────────────────────────────────────
-
-    def _process_folder(self, folder_id: str, current_dir: Path) -> None:
-        """递归处理指定 folderId 的内容，下载文件并继续遍历子文件夹。"""
-        print(f"\n📁 Processing folder: {current_dir}")
-        items_to_download: List[KnowledgeItem] = []
-        subfolders: List[KnowledgeItem] = []
-
-        # 分页获取当前文件夹下的所有条目
-        cursor = ""
-        page = 0
-        while True:
-            page += 1
-            resp = self.api.get_share_info(
-                share_id=self.share_id,
-                limit=20,
-                cursor=cursor,
-                folder_id=folder_id,
-            )
-            if resp.code != 0:
-                print(f"⚠️  Failed to fetch content for folderId={folder_id}, skipping.")
-                return
-
-            for item in resp.knowledge_list:
-                if item.folder_info is not None:
-                    subfolders.append(item)
-                else:
-                    items_to_download.append(item)
-
-            if resp.is_end or not resp.next_cursor:
-                break
-            cursor = resp.next_cursor
-            time.sleep(0.3)  # 礼貌性延时
-
-        # 下载当前目录的文件
-        if items_to_download:
-            print(f"  📥 Found {len(items_to_download)} files, downloading...")
-            failures = self.downloader.download_files_concurrently(
-                items_to_download, current_dir
-            )
-            self._all_failed.extend(failures)
-
-        # 递归处理子文件夹
-        for folder_item in subfolders:
-            folder_info = folder_item.folder_info
-            sub_dir_name = sanitize_name(folder_info.name)
-            sub_dir_path = current_dir / sub_dir_name
-            sub_dir_path.mkdir(parents=True, exist_ok=True)
-            self._process_folder(folder_info.folder_id, sub_dir_path)
+    # 旧的 _process_folder 已由统一的 traverser + download_knowledge_files 替代（见 start_sync）
 
     # ── 失败重试 ───────────────────────────────────────────────
 
@@ -146,10 +108,5 @@ class SyncManager:
         print("Synchronization process finished.")
 
 
-# ── 工具函数 ────────────────────────────────────────────────────
-
-def sanitize_name(name: str) -> str:
-    """清理文件夹名称，移除非法字符。"""
-    if not name:
-        return "unnamed_folder"
-    return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
+# 工具函数已统一到 downloader.sanitize_name
+# traverser.py 负责目录结构收集

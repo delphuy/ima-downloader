@@ -9,10 +9,11 @@
 ## 功能特点
 
 - 📋 粘贴分享链接，`share_id` 自动提取
-- 📁 递归遍历所有子文件夹
-- ⚡ 并发下载（20 线程），速度快
-- 🔄 增量下载：已存在的文件自动跳过，再次运行可断点续传
-- 🌙 暗色主题 GUI，一键启动
+- 📁 递归遍历所有子文件夹，按分类分组并发（同一类在一个线程，多类并行）
+- ⚡ 智能并发 + 浏览器打印网页为 PDF（链接类内容优先转 PDF）
+- 🔄 增量下载：已存在的文件自动跳过
+- 🎨 现代美观 GUI（ttk 样式，进度条，简洁大方）
+- 🌙 暗色主题，一键启动 start.bat
 
 ---
 
@@ -95,15 +96,16 @@ chmod +x start.sh
 
 ```
 .
-├── gui.py           # GUI 主程序（双击 start.bat 启动它）
+├── gui.py           # GUI 主程序（现代 ttk 界面）
 ├── api_service.py   # IMA API 调用封装
-├── downloader.py    # 文件下载（并发 + 断点续传）
+├── downloader.py    # 下载引擎（支持分组并发 + 网页打印 PDF）
 ├── models.py        # 数据模型
-├── sync_manager.py  # 递归遍历 + 失败重试
+├── traverser.py     # 递归收集 + 分类分组
+├── sync_manager.py  # CLI 同步
 ├── main.py          # CLI 入口
-├── requirements.txt # Python 依赖（仅需 requests）
-├── start.bat        # 一键启动脚本
-├── README.md        # 英文说明
+├── requirements.txt # 仅需 requests
+├── start.bat        # 一键启动
+├── README.md        # 英文
 └── README_zh.md     # 本文件
 ```
 
@@ -111,19 +113,25 @@ chmod +x start.sh
 
 ## 配置参数
 
-如需修改并发线程数、请求超时等参数，编辑 `downloader.py`：
+如需修改参数，编辑 `downloader.py`：
 
 ```python
-TIMEOUT = 30       # HTTP 请求超时（秒）
-MAX_WORKERS = 20   # 并发下载线程数
+TIMEOUT = 30                  # HTTP 请求超时（秒）
+MAX_WORKERS = 20              # 文件下载线程数
+MAX_CATEGORY_WORKERS = 6      # 分类并行数（同一分类内单线程）
 ```
 
 ---
 
 ## 常见问题
 
-**Q：双击 `start.bat` 没反应 / 一闪而过？**
-A：右键 → 编辑 打开 `start.bat`，在最后加一行 `pause`，保存后重新双击运行，可以看到错误信息。最常见原因是 Python 没有加入 PATH。
+**Q：双击 `start.bat` 没反应 / 一闪而过，没有主界面？**
+A：常见原因：
+1. Python 未安装 tkinter（安装 Python 时勾选 "tcl/tk and IDLE"）。
+2. 运行时错误被隐藏。
+   - 右键编辑 start.bat，在末尾加 `pause`，重新运行查看错误。
+   - 或直接双击运行 `python gui.py` （会显示控制台错误）。
+启动脚本已优化，会尝试回退并提示。
 
 **Q：提示"无法提取 share_id"？**
 A：检查分享链接是否完整，确保包含 `shareId=xxxxxxxx` 这段。把 IMA 复制的整段文字直接粘贴即可，程序会自动提取。
@@ -133,6 +141,12 @@ A：不会。已存在的文件自动跳过，不会重复下载。
 
 **Q：某个文件下载失败了怎么办？**
 A：日志区会显示 `[FAIL] 文件名 — 错误原因`，确认问题后重新运行即可，已下载的文件不会重复下载。
+
+**Q：链接类内容现在怎么处理？**
+A：优先用浏览器 headless 打印为 PDF（类似 Ctrl+P 保存 PDF），失败则保存为可双击的 .url 链接文件。
+
+**Q：下载很多文件时会更快吗？**
+A：是的！现在按顶层分类分组：同一分类的文件在一个线程内下载，不同分类并行（默认最多 6 个分类并发）。
 
 ---
 

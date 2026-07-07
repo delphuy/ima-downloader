@@ -39,13 +39,16 @@ if errorlevel 1 (
 )
 echo [OK] Dependencies ready
 
-REM --- 3. Launch GUI (minimized, no CMD window) ---
+REM --- 3. Launch GUI ---
 echo.
 echo [2/2] Launching GUI...
 start "" /min pythonw.exe gui.py
 if errorlevel 1 (
     echo.
-    echo [WARNING] pythonw failed, trying python...
+    echo [WARNING] pythonw failed, trying console python (will show errors)...
     python gui.py
     pause
+) else (
+    echo [OK] GUI launched (pythonw).
+    echo If no window appears, right-click start.bat and add 'pause' at end to debug.
 )
