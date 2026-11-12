@@ -20,6 +20,22 @@ Thumbs.db
 
 # Downloads (user data - not part of repo)
 downloads/
+downloads_v106_selftest/
+downloads_v107_selftest/
+downloads_v108_originals/
+
+# Credentials & session (login tickets / APIKey - never commit)
+openapi_credentials.json
+ima_session.json
+ima_login_debug.json
+
+# Runtime login artifacts
+ima_login_qr.png
+
+# Legacy modules removed from the repo (kept locally only)
+sync_manager.py
+client_harvest.py
+probe_openapi.py
 
 # OS artifacts
 *.lnk

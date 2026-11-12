@@ -23,7 +23,7 @@ echo [OK] Python installed
 REM --- 2. Check / install dependencies ---
 echo.
 echo [1/2] Checking dependencies...
-python -c "import requests" >nul 2>&1
+python -c "import requests, cryptography, pypdf" >nul 2>&1
 if errorlevel 1 (
     echo     Installing requests...
     python -m pip install -r requirements.txt >nul 2>&1

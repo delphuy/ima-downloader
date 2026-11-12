@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple, List
 
 from api_service import ImaApiService
-from downloader import extract_download_url, build_safe_filename, sanitize_name, get_content_type
+from downloader import (
+    build_safe_filename,
+    sanitize_name,
+    get_content_type,
+    resolve_item_download,
+)
 from models import KnowledgeFile
 
 
@@ -90,22 +95,37 @@ def _recurse_collect(
                 )
             else:
                 # 文件：附加当前相对路径（使用 build_safe_filename 确保带扩展名）
-                url = extract_download_url(item.jump_url)
+                # v1.0.4: 服务端已不再给匿名请求返回 jump_url（返回空）。
+                # 旧逻辑 "if url and safe_name" 会把无 URL 条目静默丢弃，
+                # 导致 "目录齐全但文件全空"。现在全量收集：
+                #   - 有 jump_url  → source_kind=original
+                #   - 无 jump_url  → cover_urls 推导（图片原件/首页预览）
+                #   - 都没有      → source_kind=metadata
+                # v1.0.5: 解析文本/摘要默认不落盘（下载层 save_texts 开关，默认关）
+                url, kind = resolve_item_download(item)
                 safe_name = build_safe_filename(
                     item.title,
                     item=item,
                     download_url=url,
                 )
-                if url and safe_name:
-                    ctype = get_content_type(item.title, item.media_type_info)
-                    files.append(
-                        KnowledgeFile(
-                            url=url,
-                            rel_path=current_rel / safe_name,
-                            title=safe_name,
-                            content_type=ctype,
-                        )
+                if not safe_name:
+                    safe_name = f"未命名条目_{len(files) + 1}"
+                ctype = get_content_type(item.title, item.media_type_info)
+                files.append(
+                    KnowledgeFile(
+                        url=url,
+                        rel_path=current_rel / safe_name,
+                        title=safe_name,
+                        content_type=ctype,
+                        source_kind=kind,
+                        summary_text=item.introduction or "",
+                        abstract_text=item.item_abstract or "",
+                        media_id=item.media_id or "",
+                        file_size=str(item.file_size or ""),
+                        md5_sum=str(item.md5_sum or ""),
+                        raw_file_url=item.raw_file_url or "",  # v1.0.7: 收割匹配备用键
                     )
+                )
 
         if resp.is_end or not resp.next_cursor:
             break

@@ -1,1 +1,7 @@
 requests>=2.28.0
+
+# v1.0.8 原件直下管线硬依赖：
+#   cryptography — 加密信封协议（AES-GCM 请求加密 + RSA-OAEP 密钥封装）
+#   pypdf        — 下载完成后逐份 PDF 页数校验
+cryptography>=3.4.0
+pypdf>=3.0.0

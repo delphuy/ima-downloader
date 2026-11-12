@@ -10,19 +10,20 @@ import tempfile
 import shutil
 import time
 from pathlib import Path
-from tkinter import Tk, END, DISABLED, NORMAL, filedialog, Text
+from tkinter import Tk, END, DISABLED, NORMAL, filedialog, Text, Toplevel
 import tkinter as tk
 from tkinter import ttk
 import tkinter.scrolledtext as scrolledtext
 import tkinter.messagebox as messagebox
 from api_service import ImaApiService
-from downloader import FileDownloader, sanitize_name
-from traverser import collect_all_files, collect_grouped_files
+from ima_auth import get_session, login_flow
+from original_minter import run_originals_sync, OriginalsReport
+from traverser import collect_all_files
 
 # ============================================================
 # VERSION & UPDATE CONFIG
 # ============================================================
-__VERSION__ = "1.0.3"
+__VERSION__ = "1.0.8"
 UPDATE_API = "https://api.github.com/repos/delphuy/ima-downloader/releases/latest"
 GITHUB_RELEASES = "https://github.com/delphuy/ima-downloader/releases"
 
@@ -45,11 +46,23 @@ LANG["en"] = {
     "no_share_id":   "Cannot extract share_id — check the link",
     "done_ok":       "✅ Download complete",
     "done_fail":     "❌ Download failed",
+    "done_full":     "✅ All files downloaded (originals)",
+    "done_partial":  "⚠️ Finished — some items limited by server",
+    "done_empty":    "❌ Nothing downloaded — server restricted this share",
+    "verify_line":   "🔬 Byte-verify: pass {sp} · mismatch {sf} · preview ok {po} · preview bad {pb}",
+    "verify_written": "📋 Per-file verification report saved: {path}",
     "cancelled":     "⏹ Cancelled",
     "scan_files":    "Scanning knowledge base...",
     "total_files":   "Found {n} files, starting download",
     "existing":      "Already present: {n} files",
     "folder":        "📁 {name}",
+    "btn_login":     "📱 QR Login",
+    "login_status_on":  "✅ Logged in (WeChat QR · auto-renews; rescan only when it expires)",
+    "login_status_off": "❌ Not logged in — click 'QR Login' and scan with WeChat",
+    "login_scanning":   "📱 Generating QR code… scan with WeChat, then confirm on your phone",
+    "login_ok":      "✅ Login OK — paste a share link and click Start to get full originals",
+    "login_fail":    "❌ Login not completed — click 'QR Login' again",
+    "login_required": "❌ Please log in first (click '📱 QR Login' and scan with WeChat)",
     "update_dismiss": "✕",
     "lang_label":    "中文 | EN",
     "btn_check_update": "🔄 Check Update",
@@ -74,11 +87,23 @@ LANG["zh"] = {
     "no_share_id":   "❌ 无法提取 share_id，请检查链接",
     "done_ok":       "✅ 全部下载完成",
     "done_fail":     "❌ 下载失败",
+    "done_full":     "✅ 全部原件下载完成",
+    "done_partial":  "⚠️ 下载完成 — 部分内容受服务端限制",
+    "done_empty":    "❌ 未下载到任何文件 — 服务端限制该分享",
+    "verify_line":   "🔬 字节校验: 通过 {sp} · 不符 {sf} · 预览通过 {po} · 预览异常 {pb}",
+    "verify_written": "📋 已生成逐文件校验报告: {path}",
     "cancelled":     "⏹ 已取消",
     "scan_files":    "📊 扫描知识库...",
     "total_files":   "共 {n} 个文件，开始下载",
     "existing":      "已存在 {n} 个文件",
     "folder":        "📁 {name}",
+    "btn_login":     "📱 扫码登录",
+    "login_status_on":  "✅ 已登录（微信扫码 · 票据自动续期，过期才需重扫）",
+    "login_status_off": "❌ 未登录 — 点「扫码登录」，用微信扫一下即可",
+    "login_scanning":   "📱 正在生成登录二维码……请用微信扫码并在手机上确认",
+    "login_ok":      "✅ 登录成功 — 粘贴分享链接，点「开始下载」即可拿完整原件",
+    "login_fail":    "❌ 登录未完成，请重新点「扫码登录」",
+    "login_required": "❌ 请先扫码登录（点「📱 扫码登录」，用微信扫一下）",
     "update_dismiss": "✕",
     "lang_label":    "中文 | EN",
     "btn_check_update": "🔄 检查更新",
@@ -227,15 +252,19 @@ def extract_share_id(text):
 # DOWNLOAD TASK
 # ============================================================
 class DownloadTask:
-    def __init__(self, share_id, root_dir, on_log, on_progress, on_done, on_cat_progress=None, multi_thread=True, print_pdf=True):
+    """v1.0.8: 扫码登录 + 加密信封原件直下（零客户端依赖）。
+
+    流程：匿名遍历分享库拿清单 → 登录态逐个签发原件地址 → 下载 → 字节级校验。
+    """
+
+    def __init__(self, share_id, root_dir, on_log, on_progress, on_done,
+                 multi_thread=True):
         self.share_id = share_id
         self.root_dir = root_dir
         self.on_log = on_log
         self.on_progress = on_progress
         self.on_done = on_done
-        self.on_cat_progress = on_cat_progress
         self.multi_thread = multi_thread
-        self.print_pdf = print_pdf
         self._cancelled = False
 
     def cancel(self):
@@ -245,17 +274,33 @@ class DownloadTask:
         return self._cancelled
 
     def run(self):
+        """执行下载，回调 on_done(result)。
+
+        result 语义：
+          - OriginalsReport：正常结束（GUI 按 downloaded/skipped/failed 分档）
+          - "cancelled"：用户取消
+          - False：异常失败
+        """
         try:
-            api = ImaApiService()
-            self._scan_and_download(api)
-            self.on_done(True)
+            sess = get_session()
+            if not sess.ensure_fresh(on_log=self.on_log):
+                self.on_log("❌ 登录态已失效，请重新点「📱 扫码登录」")
+                self.on_done(False)
+                return
+            report = self._scan_and_download(sess)
+            if self._cancelled:
+                self.on_done("cancelled")
+            else:
+                self.on_done(report)
         except Exception as e:
             self.on_log(f"[错误] {e}")
             self.on_done(False)
 
-    def _scan_and_download(self, api):
-        # 使用分组收集器（按顶层分类分组）
-        def on_folder(rel: Path, name: str):
+    def _scan_and_download(self, sess) -> OriginalsReport:
+        # 1) 匿名遍历分享库（列表本身无需登录）
+        api = ImaApiService()
+
+        def on_folder(rel, name):
             self.on_log(f"📁 {rel}")
 
         root_name, all_files = collect_all_files(
@@ -264,83 +309,35 @@ class DownloadTask:
             on_folder=on_folder,
             cancel_check=self.is_cancelled,
         )
-        # group by type for multi-thread
-        grouped = {}
-        for kf in all_files:
-            ctype = kf.content_type or "文章类型"
-            if ctype not in grouped:
-                grouped[ctype] = []
-            grouped[ctype].append(kf)
+        if self._cancelled:
+            self.on_log(s("cancelled"))
+            return OriginalsReport()
         if not root_name:
-            self.on_log("❌ 获取目录失败")
-            return
+            self.on_log("❌ 获取知识库目录失败")
+            return OriginalsReport()
 
         root_path = Path(self.root_dir) / root_name
         root_path.mkdir(parents=True, exist_ok=True)
         self.on_log(s("folder", name=root_name))
 
-        # 正确的增量检查
-        existing = {
-            p.relative_to(root_path).as_posix()
-            for p in root_path.rglob("*")
-            if p.is_file()
-        }
-        self.on_log(s("existing", n=len(existing)))
+        # 2) 有 media_id 的条目才能签发原件（链接类无文件实体）
+        targets = [kf for kf in all_files if kf.media_id]
+        no_mid = len(all_files) - len(targets)
+        if no_mid:
+            self.on_log(f"⚠️ {no_mid} 个条目无文件实体（纯链接），跳过")
+        self.on_log(s("total_files", n=len(targets)))
 
-        total_files = sum(len(fs) for fs in grouped.values())
-        self.on_log(s("scan_files"))
-        self.on_log(s("total_files", n=total_files))
-
+        # 3) 登录态批量签发 + 下载 + 校验
+        report = run_originals_sync(
+            sess, targets, root_path, self.share_id,
+            on_log=self.on_log,
+            on_progress=self.on_progress,
+            cancel_check=self.is_cancelled,
+            workers=8 if self.multi_thread else 3,
+        )
         if self._cancelled:
             self.on_log(s("cancelled"))
-            return
-
-        if self.multi_thread:
-            self.on_log(f"发现 {len(grouped)} 个类型，将按类型并行下载")
-            # 使用分组下载：同一类型一个线程，多类型并行
-            dl = FileDownloader(max_workers=20, max_category_workers=3)
-            dl.set_logger(self.on_log)
-
-            def progress_wrapper(current, total, name):
-                self.on_progress(current, total, name)
-
-            def cat_progress(cat_name, cat_cur, cat_tot, name):
-                self.on_log(f"[{cat_name}] {cat_cur}/{cat_tot} {name}")
-                if self.on_cat_progress:
-                    self.on_cat_progress(cat_name, cat_cur, cat_tot, name)
-
-            failures = dl.download_grouped_files(
-                grouped,
-                root_path,
-                on_progress=progress_wrapper,
-                on_category_progress=cat_progress,
-                cancel_check=self.is_cancelled,
-                existing_rels=existing,
-                enable_print_pdf=self.print_pdf,
-            )
-        else:
-            # 多线程关闭：保留小并发
-            self.on_log("多线程已关闭，使用小并发（最多3个文件同时下载）")
-            dl = FileDownloader(max_workers=3)
-            dl.set_logger(self.on_log)
-
-            def progress_wrapper(current, total, name):
-                self.on_progress(current, total, name)
-
-            failures = dl.download_knowledge_files(
-                [f for fs in grouped.values() for f in fs],  # flat
-                root_path,
-                on_progress=progress_wrapper,
-                cancel_check=self.is_cancelled,
-                existing_rels=existing,
-                enable_print_pdf=self.print_pdf,
-            )
-
-        for f in failures:
-            self.on_log(f"[FAIL] {f.output_path} — 下载失败")
-
-        if not self._cancelled:
-            self.on_log(s("done_ok"))
+        return report
 
 
 # ============================================================
@@ -350,11 +347,18 @@ class ImaDownloaderGUI:
     _lang = "zh"          # default to Chinese
     _root_after = None
 
+    def _safe_after(self, ms, fn):
+        """root.after 包装：窗口销毁/主循环未跑时静默放弃，不炸后台线程。"""
+        try:
+            return self.root.after(ms, fn)
+        except Exception:
+            return None
+
     def __init__(self):
         self.root = Tk()
         self.root.withdraw()  # hide until fully configured to prevent flash at default position
         self.root.geometry("950x680")  # set early size to avoid default small/long window
-        ImaDownloaderGUI._root_after = self.root.after
+        ImaDownloaderGUI._root_after = self._safe_after
         self.root.title("IMA Knowledge Base Downloader")
         self._task = None
         self._has_placeholder = True
@@ -374,18 +378,17 @@ class ImaDownloaderGUI:
 
         # All widgets that need language refresh
         self._widgets = {}
-        self._category_widgets = {}  # For multi-thread visibility
 
         # Checkboxes for options (default checked)
         self.multi_thread_var = tk.BooleanVar(value=True)
-        self.print_pdf_var = tk.BooleanVar(value=True)
         self.multi_thread_var.trace_add("write", self._on_multi_thread_changed)
-        self.print_pdf_var.trace_add("write", lambda *args: None)  # placeholder if needed later
 
         self._build_ui()
         self.apply_theme(self.current_theme)  # Apply (light by default)
         self._on_multi_thread_changed()  # set initial visibility based on checkbox
         self._entry_dir.insert(0, str(Path("downloads").resolve()))
+        self._refresh_login_status()  # v1.0.8: 打开即按已存票据同步显示登录状态
+        self._startup_session_check()  # v1.0.8: 恢复登录态（静默续期，不阻塞 UI）
 
         self._center_window()
 
@@ -460,6 +463,18 @@ class ImaDownloaderGUI:
         self._widgets["btn_browse"] = ttk.Button(dir_frame, text=s("browse"), style="Flat.TButton", command=self._browse)
         self._widgets["btn_browse"].pack(side="right")
 
+        # ── v1.0.8: 扫码登录行（取代 v1.0.4 OpenAPI 凭证区）──
+        login_frame = ttk.Frame(card)
+        login_frame.pack(fill="x", pady=(6, 0))
+        self._widgets["btn_login"] = ttk.Button(login_frame, text=s("btn_login"),
+                                                style="PrimaryFlat.TButton",
+                                                command=self._do_qr_login)
+        self._widgets["btn_login"].pack(side="left")
+        self._widgets["lbl_login_status"] = ttk.Label(
+            login_frame, text=s("login_status_off"), style="TLabel",
+            font=("Microsoft YaHei", 9))
+        self._widgets["lbl_login_status"].pack(side="left", padx=(10, 0))
+
         btns = ttk.Frame(card)
         btns.pack(pady=(8, 2))
 
@@ -467,9 +482,6 @@ class ImaDownloaderGUI:
         cb_multi = ttk.Checkbutton(btns, text="多线程", variable=self.multi_thread_var, style="TCheckbutton")
         cb_multi.pack(side="left", padx=(0, 8))
         self._widgets["cb_multi"] = cb_multi
-        cb_print = ttk.Checkbutton(btns, text="网页打印为pdf", variable=self.print_pdf_var, style="TCheckbutton")
-        cb_print.pack(side="left", padx=(0, 8))
-        self._widgets["cb_print"] = cb_print
 
         self._widgets["btn_start"] = ttk.Button(btns, text=s("start"), style="PrimaryFlat.TButton", command=self._start, width=18)
         self._widgets["btn_start"].pack(side="left", padx=6)
@@ -477,7 +489,10 @@ class ImaDownloaderGUI:
         self._widgets["btn_cancel"].pack(side="left", padx=6)
 
         # Explanation text below buttons - full width, minimal wrap, tight
-        note_text = "勾选多线程后，会多耗用一些电脑资源，若电脑资源紧张，可取消勾选；若不希望将网页url等下载为pdf，可取消打印勾选。"
+        note_text = ("v1.0.8 新流程：点「📱 扫码登录」用微信扫码（一次登录 30 天内免重复登录）→ 粘贴分享链接 → 点「开始下载」，"
+                     "即可下载每个文档的完整原件（PDF/Word/图片均为原件字节，非首页预览）。"
+                     "下载完自动做字节数 + 文件类型双重校验并生成校验报告；已下载过的文件再次运行会自动跳过（增量续传）。"
+                     "勾选多线程下载更快，电脑资源紧张时可取消勾选。")
         note_label = ttk.Label(card, text=note_text, font=("Microsoft YaHei", 8), wraplength=900, foreground="#64748b")
         note_label.pack(fill="x", pady=(2, 0))
         self._widgets["note_label"] = note_label
@@ -490,27 +505,6 @@ class ImaDownloaderGUI:
 
         self._progress_bar = ttk.Progressbar(prog_frame, mode="determinate", maximum=100)
         self._progress_bar.pack(fill="x", pady=(4, 0))
-
-        # ── Category Progress Section (for multi-thread visibility, per spec) ──
-        self._category_frame = ttk.LabelFrame(self.root, text="进行中的类型", padding=4)
-        self._category_frame.pack(fill="x", padx=12, pady=(1, 1))
-
-        # Use a canvas + inner frame for potential scrolling if many categories
-        canvas_bg = THEMES.get(self.current_theme, THEMES['light'])['log_bg']
-        self._cat_canvas = tk.Canvas(self._category_frame, height=90, highlightthickness=0, bg=canvas_bg)
-        self._cat_inner = ttk.Frame(self._cat_canvas)
-        cat_scroll = ttk.Scrollbar(self._category_frame, orient="vertical", command=self._cat_canvas.yview)
-        self._cat_canvas.configure(yscrollcommand=cat_scroll.set)
-
-        self._cat_canvas.pack(side="left", fill="both", expand=True)
-        cat_scroll.pack(side="right", fill="y")
-        self._cat_canvas.create_window((0, 0), window=self._cat_inner, anchor="nw")
-
-        def _on_cat_frame_config(event):
-            self._cat_canvas.configure(scrollregion=self._cat_canvas.bbox("all"))
-        self._cat_inner.bind("<Configure>", _on_cat_frame_config)
-
-        self._category_widgets = {}  # cat_name -> {'name': Label, 'bar': Progressbar, 'status': Label}
 
         # ── Log ──
         log_label = ttk.Label(self.root, text="日志", font=("Microsoft YaHei", 9))
@@ -602,40 +596,20 @@ class ImaDownloaderGUI:
         if hasattr(self, '_has_placeholder') and self._has_placeholder:
             self._text_share.configure(fg=theme["dim"])
 
-        # Refresh existing category rows
-        for w in self._category_widgets.values():
-            w["name"].configure(foreground=theme["text"])
-            w["status"].configure(foreground=theme["dim"])
-            w["current"].configure(foreground=theme["dim"])
-
-        # Canvas bg
-        if hasattr(self, "_cat_canvas"):
-            self._cat_canvas.configure(bg=theme["log_bg"])
-
         # Force style on checkboxes
-        for cb_key in ["cb_multi", "cb_print"]:
+        for cb_key in ["cb_multi"]:
             if cb_key in self._widgets:
                 self._widgets[cb_key].configure(style="TCheckbutton")
 
         # Update note color and font
         if "note_label" in self._widgets:
             self._widgets["note_label"].configure(foreground=theme["dim"], font=("Microsoft YaHei", 8))
+        if "lbl_login_status" in self._widgets:
+            self._widgets["lbl_login_status"].configure(foreground=theme["dim"])
 
     def _on_multi_thread_changed(self, *args):
-        if self.multi_thread_var.get():
-            try:
-                # re-pack before the log to maintain layout order
-                self._category_frame.pack(fill="x", padx=12, pady=(4, 2), before=self._log_widget)
-            except Exception:
-                self._category_frame.pack(fill="x", padx=12, pady=(4, 2))
-            # ensure inner canvas is visible and scrolled
-            if hasattr(self, '_cat_canvas'):
-                self._cat_canvas.pack(side="left", fill="both", expand=True)
-                self._cat_canvas.configure(scrollregion=self._cat_canvas.bbox("all") or (0,0,0,120))
-        else:
-            self._category_frame.pack_forget()
-        self.root.update_idletasks()
-        self.root.update()  # force refresh
+        # v1.0.8: 多线程只影响下载并发数（8 vs 3），不再切换分类进度区
+        pass
 
     def _center_window(self):
         self.root.update_idletasks()
@@ -647,11 +621,6 @@ class ImaDownloaderGUI:
         self.root.geometry(f'{width}x{height}+{x}+{y}')
         self.root.deiconify()  # show after fully positioned to prevent initial flash at default (left) position
 
-
-        # Update category section if exists
-        if hasattr(self, '_category_frame'):
-            self._category_frame.configure(style="TLabelframe")
-
     def toggle_theme(self):
         new_theme = "dark" if self.current_theme == "light" else "light"
         self.apply_theme(new_theme)
@@ -661,57 +630,6 @@ class ImaDownloaderGUI:
                 f.write(new_theme)
         except:
             pass
-
-    # ----------------------------------------------------------------
-    # CATEGORY PROGRESS UI (multi-thread visibility per spec)
-    # ----------------------------------------------------------------
-    def _get_or_create_category_row(self, cat_name):
-        if cat_name in self._category_widgets:
-            return self._category_widgets[cat_name]
-
-        row = ttk.Frame(self._cat_inner)
-        row.pack(fill="x", pady=2)
-
-        name_label = ttk.Label(row, text=cat_name[:20], width=22, anchor="w")
-        name_label.pack(side="left")
-
-        bar = ttk.Progressbar(row, length=200, mode="determinate", maximum=100)
-        bar.pack(side="left", padx=6)
-
-        status_label = ttk.Label(row, text="0/0", width=12)
-        status_label.pack(side="left", padx=4)
-
-        current_label = ttk.Label(row, text="", width=35, anchor="w")
-        current_label.pack(side="left")
-
-        widgets = {
-            "row": row,
-            "name": name_label,
-            "bar": bar,
-            "status": status_label,
-            "current": current_label
-        }
-        self._category_widgets[cat_name] = widgets
-        if hasattr(self, '_cat_canvas'):
-            self._cat_canvas.configure(scrollregion=self._cat_canvas.bbox("all"))
-        return widgets
-
-    def _update_category_progress_ui(self, cat_name, current, total, filename=""):
-        widgets = self._get_or_create_category_row(cat_name)
-        pct = int(current * 100 / total) if total > 0 else 0
-        widgets["bar"]["value"] = pct
-        widgets["status"].configure(text=f"{current}/{total}")
-        widgets["current"].configure(text=filename[:40] if filename else "")
-        # update scroll
-        if hasattr(self, '_cat_canvas'):
-            self._cat_canvas.configure(scrollregion=self._cat_canvas.bbox("all"))
-
-    def _clear_category(self, cat_name):
-        if cat_name in self._category_widgets:
-            self._category_widgets[cat_name]["row"].destroy()
-            del self._category_widgets[cat_name]
-            if hasattr(self, '_cat_canvas'):
-                self._cat_canvas.configure(scrollregion=self._cat_canvas.bbox("all"))
 
     # ----------------------------------------------------------------
     # LANGUAGE TOGGLE — refresh all UI strings
@@ -730,6 +648,14 @@ class ImaDownloaderGUI:
         w["btn_update"].configure(text=s("btn_update"))
         w["btn_github"].configure(text=s("open_github"))
         w["btn_dismiss"].configure(text=s("update_dismiss"))
+
+        # v1.0.8: 刷新登录行文案
+        if "btn_login" in w:
+            w["btn_login"].configure(text=s("btn_login"))
+        if "lbl_login_status" in w:
+            logged = get_session().is_logged_in()
+            w["lbl_login_status"].configure(
+                text=s("login_status_on" if logged else "login_status_off"))
 
         # Refresh share text placeholder (keep current content unless it was placeholder)
         was_placeholder = self._has_placeholder
@@ -879,13 +805,96 @@ class ImaDownloaderGUI:
         self._widgets["btn_browse"].configure(state=s_state)
         self._widgets["btn_start"].configure(state=s_state)
         self._widgets["btn_cancel"].configure(state=s_state)
-        # disable options during download
         if "cb_multi" in self._widgets:
             self._widgets["cb_multi"].configure(state=s_state)
-        if "cb_print" in self._widgets:
-            self._widgets["cb_print"].configure(state=s_state)
+        # v1.0.8: 下载期间锁定扫码登录按钮
+        if "btn_login" in self._widgets:
+            self._widgets["btn_login"].configure(state=s_state)
+
+    # ----------------------------------------------------------------
+    # v1.0.8: 扫码登录（微信 QR → ima 票据，一次登录 30 天免登）
+    # ----------------------------------------------------------------
+    def _do_qr_login(self):
+        self._widgets["btn_login"].configure(state=DISABLED)
+        self._widgets["lbl_progress"].configure(text=s("login_scanning"))
+        self._qr_win = None
+        self._qr_img = None
+
+        def on_qr(png_path):
+            def show():
+                # 优先在软件内弹出二维码窗口（和浏览器登录页同一张图）
+                try:
+                    img = tk.PhotoImage(file=png_path)
+                    win = Toplevel(self.root)
+                    win.title(s("btn_login"))
+                    win.attributes("-topmost", True)
+                    win.resizable(False, False)
+                    tk.Label(win, image=img, bg="white").pack(padx=16, pady=(16, 4))
+                    tk.Label(win, text=s("login_scanning"),
+                             font=("Microsoft YaHei", 10)).pack(pady=(0, 14))
+                    self._qr_win = win
+                    self._qr_img = img  # 防止 PhotoImage 被回收
+                    self._add_log("📱 二维码已在窗口中弹出，微信扫一下、手机上点「确认」")
+                except Exception:
+                    try:
+                        os.startfile(png_path)  # 兜底：系统看图工具打开
+                        self._add_log(f"📱 二维码已生成：{png_path}")
+                    except Exception:
+                        pass
+            ImaDownloaderGUI._root_after(0, show)
+
+        def worker():
+            sess = get_session()
+
+            def tl(msg):
+                ImaDownloaderGUI._root_after(0, lambda m=msg: self._add_log(m))
+
+            ok = login_flow(sess, on_log=tl, on_qr=on_qr,
+                            cancel_check=None, deadline_s=330)
+
+            def done():
+                if self._qr_win is not None:
+                    try:
+                        self._qr_win.destroy()
+                    except Exception:
+                        pass
+                    self._qr_win = None
+                self._refresh_login_status()
+                self._widgets["btn_login"].configure(state=NORMAL)
+                self._widgets["lbl_progress"].configure(
+                    text=s("login_ok") if ok else s("login_fail"))
+            ImaDownloaderGUI._root_after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_login_status(self):
+        """刷新登录状态标签（主线程调用）。"""
+        if "lbl_login_status" not in self._widgets:
+            return
+        if get_session().is_logged_in():
+            self._widgets["lbl_login_status"].configure(text=s("login_status_on"))
+        else:
+            self._widgets["lbl_login_status"].configure(text=s("login_status_off"))
+
+    def _startup_session_check(self):
+        """启动时后台静默检查/续期票据，不阻塞 UI；完成后刷新状态标签。"""
+        def worker():
+            sess = get_session()
+            if sess.is_logged_in():
+                def tl(msg):
+                    ImaDownloaderGUI._root_after(0, lambda m=msg: self._add_log(msg))
+                try:
+                    sess.ensure_fresh(on_log=tl)
+                except Exception:
+                    pass
+            ImaDownloaderGUI._root_after(0, self._refresh_login_status)
+        threading.Thread(target=worker, daemon=True).start()
 
     def _add_log(self, msg):
+        """线程安全日志：任何线程调用都转主线程执行（v1.0.8）。"""
+        ImaDownloaderGUI._root_after(0, lambda: self._append_log(msg))
+
+    def _append_log(self, msg):
         self._log_widget.configure(state="normal")
         self._log_widget.insert(END, msg + "\n")
         self._log_widget.configure(state="disabled")
@@ -897,16 +906,65 @@ class ImaDownloaderGUI:
             self._progress_bar["value"] = pct
         self.root.after(0, update)
 
-    def _on_done(self, ok):
-        self.root.after(0, lambda: self._finish(ok))
+    def _on_done(self, result):
+        self.root.after(0, lambda: self._finish(result))
 
-    def _finish(self, ok):
+    def _finish(self, result):
+        """v1.0.4 三态诚实收尾。
+
+        result: OriginalsReport（正常结束）/ "cancelled" / False（异常）
+        分档规则：
+          full    = 全部条目拿到原件（original+image-original，含已存在），
+                    无首页预览、无仅文本、无失败
+          partial = 有产出但部分条目受服务端限制（预览/仅文本/失败）
+          empty   = 一个字节都没拿到（原件/预览/仅文本/已存在全为 0）
+        """
         self._set_ui(True)
-        self._widgets["lbl_progress"].configure(text=s("done_ok") if ok else s("done_fail"))
-        self._progress_bar["value"] = 100 if ok else 0
-        # Clear category rows when done
-        for cat in list(self._category_widgets.keys()):
-            self._clear_category(cat)
+
+        if result == "cancelled":
+            self._widgets["lbl_progress"].configure(text=s("cancelled"))
+            self._progress_bar["value"] = 0
+        elif result is False:
+            self._widgets["lbl_progress"].configure(text=s("done_fail"))
+            self._progress_bar["value"] = 0
+        else:
+            report = result
+            n_failed = len(report.failed)
+            if report.downloaded == 0 and report.text_only == 0 and report.skipped == 0:
+                state_key = "done_empty"
+            elif report.preview == 0 and report.text_only == 0 and n_failed == 0:
+                state_key = "done_full"
+            else:
+                state_key = "done_partial"
+            line = report.summary_line()
+            self._widgets["lbl_progress"].configure(
+                text=f"{s(state_key)} ｜ {line}"
+            )
+            self._add_log(f"{s(state_key)}")
+            self._add_log(f"📊 {line}")
+            # v1.0.6: 逐文件字节校验结果 + 校验报告落盘
+            self._add_log(s("verify_line", sp=report.size_pass, sf=report.size_fail,
+                            po=report.preview_ok, pb=report.preview_bad))
+            self._log_coverage(report)
+            self._write_report_logged(report)
+            self._progress_bar["value"] = 100 if state_key != "done_empty" else 0
+
+    def _log_coverage(self, report):
+        """v1.0.7: 内容覆盖统计进日志（回答「文件数对了，内容数对了吗」）。"""
+        try:
+            for line in report.content_coverage_lines():
+                self._add_log(f"   {line}")
+        except Exception:
+            pass
+
+    def _write_report_logged(self, report):
+        """v1.0.7: 统一「写校验报告 + 汇报路径」小助手。"""
+        try:
+            verify_path = report.write_verify_report()
+            if verify_path:
+                self._add_log(s("verify_written", path=str(verify_path)))
+        except Exception as e:
+            self._add_log(f"⚠️ 校验报告写入失败: {e}")
 
     # ----------------------------------------------------------------
     # ACTIONS
@@ -917,22 +975,26 @@ class ImaDownloaderGUI:
         if not sid:
             self._widgets["lbl_progress"].configure(text=s("no_share_id"))
             return
+        # v1.0.8: 必须先扫码登录（原件地址签发需登录态）
+        if not get_session().is_logged_in():
+            self._widgets["lbl_progress"].configure(text=s("login_required"))
+            messagebox.showinfo(s("btn_login"), s("login_required"))
+            return
         save = Path(self._entry_dir.get() or "downloads")
         self._set_ui(False)
         self._widgets["lbl_progress"].configure(text=s("preparing"))
         self._log_widget.configure(state="normal")
         self._log_widget.delete("1.0", END)
         self._log_widget.configure(state="disabled")
+        self._task = self._launch_task(sid, save)
 
-        # Clear previous category rows
-        for cat in list(self._category_widgets.keys()):
-            self._clear_category(cat)
-
-        self._task = DownloadTask(sid, save, self._add_log,
-                                  self._on_progress, self._on_done, self._update_category_progress_ui,
-                                  multi_thread=self.multi_thread_var.get(),
-                                  print_pdf=self.print_pdf_var.get())
-        threading.Thread(target=self._task.run, daemon=True).start()
+    def _launch_task(self, sid, save):
+        """v1.0.8: 启动原件直下任务。"""
+        task = DownloadTask(sid, save, self._add_log,
+                            self._on_progress, self._on_done,
+                            multi_thread=self.multi_thread_var.get())
+        threading.Thread(target=task.run, daemon=True).start()
+        return task
 
     def _cancel(self):
         if self._task:
